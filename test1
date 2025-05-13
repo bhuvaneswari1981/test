@@ -1,187 +1,59 @@
----
-- name: Test | Clone build artifact repo
-  hosts: "{{ var_hosts }}"
-  become: true
+- name: promoteBuildArtifact | Ensure sparse checkout is fully disabled
+  ansible.builtin.shell: |
+    git config core.sparseCheckout false
+    rm -f .git/info/sparse-checkout || true
+    git read-tree -mu HEAD
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  tags: skip_ansible_lint
 
-  roles:
-    - ansible-role-awscli
+- name: promoteBuildArtifact | Confirm artifact file exists locally
+  ansible.builtin.stat:
+    path: "{{ destination_directory }}/{{ github_repo_name }}/{{ item.artifact_folder }}/{{ item.filename }}"
+  register: artifact_stat
+  loop: "{{ files_to_release }}"
+  loop_control:
+    loop_var: item
+
+- name: promoteBuildArtifact | Add and commit artifact if it exists and has changes
+  ansible.builtin.shell: |
+    git add --force {{ item.artifact_folder }}/{{ item.filename }}
+    if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
+      git commit -m "{{ commit_message }}"
+    fi
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  loop: "{{ files_to_release }}"
+  loop_control:
+    loop_var: item
+  when: item_stat.stat.exists
   vars:
-    github_repo_name: "fpps-build-artifacts"
-    destination_directory: "/opt/tmp"
-    build_user: "{{ lookup('ansible.builtin.env', 'BUILDUSER') }}"
-    build_token: "{{ lookup('ansible.builtin.env', 'BUILDTOKEN') }}"
-    commit_message: "Promoting artifacts for {{ lookup('ansible.builtin.env', 'tag_name') }} at (date -u +%y-%m-%d)"
+    item_stat: "{{ artifact_stat.results[loop.index0] }}"
+  tags: skip_ansible_lint
 
-  pre_tasks:
-    - name: promoteBuildArtifact | Include all files in vars
-      include_vars:
-        dir: ../vars/fpps-defaults
-        extensions:
-          - yml
+- name: promoteBuildArtifact | Pull latest to avoid push rejection
+  ansible.builtin.shell: git pull origin {{ target_branch }} --rebase
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  tags: skip_ansible_lint
 
-    - name: promoteBuildArtifact | Include playbook pre tasks
-      include_tasks: ../tasks/playbookPreTasks.yml
+- name: promoteBuildArtifact | Push changes to target branch
+  ansible.builtin.shell: git push origin {{ target_branch }}
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  tags: skip_ansible_lint
 
-  tasks:
-    - name: promoteBuildArtifact | Reset no log if verbosity is high enough
-      ansible.builtin.set_fact:
-        no_log_value: false
-      when: ansible_verbosity >= 3
+- name: promoteBuildArtifact | Verify pushed artifact is in remote
+  ansible.builtin.shell: |
+    git fetch origin {{ target_branch }}
+    git ls-tree -r origin/{{ target_branch }} --name-only
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: remote_listing
+  tags: skip_ansible_lint
 
-    - name: promoteBuildArtifact | Set facts for checkout
-      ansible.builtin.set_fact:
-        destination_repo: "https://{{ build_user }}:{{ build_token }}@github.com/department-of-veterans-affairs/{{ github_repo_name }}"
+- name: promoteBuildArtifact | Show remote contents after push
+  debug:
+    msg: "{{ remote_listing.stdout_lines }}"
+  tags: always
 
-    - name: promoteBuildArtifact | Set default facts
-      set_fact:
-        files_to_release: "{{ lookup('ansible.builtin.env', 'files_to_release') }}"
-        tag_name: "{{ lookup('ansible.builtin.env', 'tag_name') }}"
-        target_branch: "{{ lookup('ansible.builtin.env', 'target_branch') }}"
-
-    - name: promoteBuildArtifact | Create dir to clone
-      ansible.builtin.file:
-        path: "{{ destination_directory }}"
-        state: directory
-        mode: 0750
-
-    - name: promoteBuildArtifact | Ensure destination directory exists
-      ansible.builtin.file:
-        path: "{{ destination_directory }}/{{ github_repo_name }}"
-        state: directory
-        mode: '0750'
-
-    - name: promoteBuildArtifact | Initialize and checkout target branch
-      ansible.builtin.shell: |
-        git init
-        git remote add origin {{ destination_repo }} 2>/dev/null || true
-        git fetch origin
-        git checkout -f $(git rev-parse --verify origin/master 2>/dev/null || \
-                          git rev-parse --verify origin/main 2>/dev/null || echo "HEAD")
-        git branch -D {{ target_branch }} 2>/dev/null || true
-        git checkout -b {{ target_branch }} || git checkout {{ target_branch }}
-        git fetch --tags
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      tags: skip_ansible_lint
-
-    - name: promoteBuildArtifact | Fetch all git tags
-      ansible.builtin.command: git tag
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      register: git_tags
-      changed_when: false
-      tags: skip_ansible_lint
-
-    - name: promoteBuildArtifact | Set default candidate number and tag list
-      ansible.builtin.set_fact:
-        candidate_number: 1
-        matching_tags: []
-
-    - name: promoteBuildArtifact | Find matching candidate tags
-      ansible.builtin.set_fact:
-        matching_tags: "{{ git_tags.stdout_lines | select('search', tag_name + '_candidate\\d+') | list }}"
-      when: app_env == 'prep' and git_tags.stdout_lines | length > 0
-
-    - name: promoteBuildArtifact | Calculate next candidate number if tags found
-      when: app_env == 'prep'
-      block:
-        - name: promoteBuildArtifact | Extract candidate numbers from tags
-          ansible.builtin.set_fact:
-            candidate_numbers: "{{ matching_tags | map('regex_search', '_candidate(\\d+)', '\\1') | select('string') | map('int') | list }}"
-          when: matching_tags | length > 0
-
-        - name: promoteBuildArtifact | Increment candidate number
-          ansible.builtin.set_fact:
-            candidate_number: "{{ candidate_numbers | max + 1 }}"
-          when: candidate_numbers is defined and candidate_numbers | length > 0
-
-    - name: promoteBuildArtifact | Set candidate suffix and release tag
-      ansible.builtin.set_fact:
-        candidate_suffix: "{{ '_candidate' + (candidate_number | string) if app_env == 'prep' else '' }}"
-        release_tag: "{{ tag_name }}{{ '_candidate' + (candidate_number | string) if app_env == 'prep' else '' }}"
-
-    - name: promoteBuildArtifact | Show calculated tag details
-      ansible.builtin.debug:
-        msg:
-          - "tag_name: {{ tag_name }}"
-          - "candidate_number: {{ candidate_number }}"
-          - "candidate_suffix: {{ candidate_suffix }}"
-          - "release_tag: {{ release_tag }}"
-      tags: always
-
-    - name: promoteBuildArtifact | Check if tag already exists
-      ansible.builtin.command: git tag -l {{ release_tag }}
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      register: local_tag_exists
-      changed_when: false
-      tags: skip_ansible_lint
-
-    - name: promoteBuildArtifact | Sparse checkout and copy artifacts
-      block:
-        - name: promoteBuildArtifact | Sparse checkout each artifact
-          include_tasks: ../tasks/sparse_checkout.yml
-          loop: "{{ files_to_release }}"
-          loop_control:
-            loop_var: item
-          vars:
-            sparse_checkout: "{{ item.artifact_folder }}/{{ item.filename }}"
-            base_dir: "{{ destination_directory }}/sparse_tmp_{{ item.artifact_folder }}"
-
-        - name: promoteBuildArtifact | Copy sparse checked out artifact into working repo
-          ansible.builtin.copy:
-            src: "{{ destination_directory }}/sparse_tmp_{{ item.artifact_folder }}/{{ github_repo_name }}/{{ item.artifact_folder }}/{{ item.filename }}"
-            dest: "{{ destination_directory }}/{{ github_repo_name }}/{{ item.artifact_folder }}/{{ item.filename }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          loop: "{{ files_to_release }}"
-          failed_when: false
-          tags: skip_ansible_lint
-
-        - name: promoteBuildArtifact | Disable sparse checkout
-          ansible.builtin.shell: |
-            git sparse-checkout init --cone
-            git sparse-checkout set --no-cone '*'
-            git read-tree -mu HEAD
-          tags: skip_ansible_lint
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-
-        - name: promoteBuildArtifact | Commit changes for each artifact
-          ansible.builtin.shell: |
-            set -eo pipefail
-            cd "{{ destination_directory }}/{{ github_repo_name }}"
-            git add --force "{{ item.artifact_folder }}/{{ item.filename }}" || true
-            if git diff --cached --quiet "{{ item.artifact_folder }}/{{ item.filename }}"; then
-              echo "Nothing to commit for {{ item.filename }}"
-            else
-              git commit -m "{{ commit_message }}" --date="$(date -R)"
-            fi
-          loop: "{{ files_to_release }}"
-          loop_control:
-            label: "{{ item.filename }}"
-          tags: skip_ansible_lint
-
-        - name: promoteBuildArtifact | Pull latest changes before pushing
-          ansible.builtin.shell: |
-            git pull --rebase origin {{ target_branch }}
-          tags: skip_ansible_lint
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-
-        - name: promoteBuildArtifact | Push changes
-          ansible.builtin.shell: |
-            cd "{{ destination_directory }}/{{ github_repo_name }}"
-            git push origin {{ target_branch }}
-          tags: skip_ansible_lint
-
-    - name: promoteBuildArtifact | Create tag
-      ansible.builtin.shell: |
-        cd "{{ destination_directory }}/{{ github_repo_name }}"
-        if [ -z "$(git tag -l {{ release_tag }})" ]; then
-          git tag -a {{ release_tag }} -m "Tagging artifacts with version {{ release_tag }}"
-          git push origin {{ release_tag }}
-        else
-          echo "Tag {{ release_tag }} already exists, skipping tag creation."
-        fi
-      tags: skip_ansible_lint 
