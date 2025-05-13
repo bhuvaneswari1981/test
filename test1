@@ -1,59 +1,63 @@
-- name: promoteBuildArtifact | Ensure sparse checkout is fully disabled
-  ansible.builtin.shell: |
-    git config core.sparseCheckout false
-    rm -f .git/info/sparse-checkout || true
-    git read-tree -mu HEAD
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  tags: skip_ansible_lint
+- name: promoteBuildArtifact | Promote each artifact from develop to {{ target_branch }}
+  block:
+    - name: Disable sparse checkout and configure Git
+      ansible.builtin.shell: |
+        git config core.sparseCheckout false
+        git config advice.detachedHead false
+        git config advice.updateSparsePath false
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
 
-- name: promoteBuildArtifact | Confirm artifact file exists locally
-  ansible.builtin.stat:
-    path: "{{ destination_directory }}/{{ github_repo_name }}/{{ item.artifact_folder }}/{{ item.filename }}"
-  register: artifact_stat
-  loop: "{{ files_to_release }}"
-  loop_control:
-    loop_var: item
+    - name: Fetch latest from remote
+      ansible.builtin.shell: |
+        git fetch origin
+        git checkout {{ target_branch }}
+        git pull origin {{ target_branch }}
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
 
-- name: promoteBuildArtifact | Add and commit artifact if it exists and has changes
-  ansible.builtin.shell: |
-    git add --force {{ item.artifact_folder }}/{{ item.filename }}
-    if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
-      git commit -m "{{ commit_message }}"
-    fi
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  loop: "{{ files_to_release }}"
-  loop_control:
-    loop_var: item
-  when: item_stat.stat.exists
-  vars:
-    item_stat: "{{ artifact_stat.results[loop.index0] }}"
-  tags: skip_ansible_lint
+    - name: Checkout artifact from develop
+      ansible.builtin.shell: |
+        git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      loop: "{{ files_to_release }}"
+      loop_control:
+        label: "{{ item.filename }}"
 
-- name: promoteBuildArtifact | Pull latest to avoid push rejection
-  ansible.builtin.shell: git pull origin {{ target_branch }} --rebase
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  tags: skip_ansible_lint
+    - name: Commit artifact if changed
+      ansible.builtin.shell: |
+        if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
+          git add {{ item.artifact_folder }}/{{ item.filename }}
+          git commit -m "Promoting artifact {{ item.filename }} for {{ tag_name }} at $(date -u +%Y-%m-%d)"
+        fi
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      loop: "{{ files_to_release }}"
+      loop_control:
+        label: "{{ item.filename }}"
 
-- name: promoteBuildArtifact | Push changes to target branch
-  ansible.builtin.shell: git push origin {{ target_branch }}
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  tags: skip_ansible_lint
+    - name: Push committed artifacts to target branch
+      ansible.builtin.shell: |
+        git push origin {{ target_branch }}
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
 
-- name: promoteBuildArtifact | Verify pushed artifact is in remote
-  ansible.builtin.shell: |
-    git fetch origin {{ target_branch }}
-    git ls-tree -r origin/{{ target_branch }} --name-only
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  register: remote_listing
-  tags: skip_ansible_lint
+    - name: Verify promoted artifacts are in remote
+      ansible.builtin.shell: |
+        git fetch origin {{ target_branch }}
+        git ls-tree -r origin/{{ target_branch }} --name-only
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      register: pushed_files
 
-- name: promoteBuildArtifact | Show remote contents after push
-  debug:
-    msg: "{{ remote_listing.stdout_lines }}"
-  tags: always
+    - name: Debug list of pushed artifacts
+      debug:
+        var: pushed_files.stdout_lines
+
+  rescue:
+    - name: Debug failure info
+      debug:
+        msg: "Artifact promotion failed at one of the steps."
+
 
