@@ -1,33 +1,102 @@
-cmd: |-
+- name: Promote | Clone and promote specific build artifacts
+  hosts: "{{ var_hosts }}"
+  become: true
+
+  roles:
+    - ansible-role-awscli
+
+  vars:
+    github_repo_name: "fpps-build-artifacts"
+    github_repo_url: "https://{{ build_user }}:{{ build_token }}@github.com/department-of-veterans-affairs/{{ github_repo_name }}"
+    destination_directory: "/opt/tmp"
+    build_user: "{{ lookup('ansible.builtin.env', 'BUILDUSER') }}"
+    build_token: "{{ lookup('ansible.builtin.env', 'BUILDTOKEN') }}"
+    commit_message: "Promoting artifacts for {{ lookup('ansible.builtin.env', 'tag_name') }} at $(date -u +%Y-%m-%d)"
+
+  pre_tasks:
+    - name: Include all vars
+      include_vars:
+        dir: ../vars/fpps-defaults
+        extensions: ['yml']
+
+    - name: Include playbook pre-tasks
+      include_tasks: ../tasks/playbookPreTasks.yml
+
+  tasks:
+    - name: Set default facts
+      set_fact:
+        files_to_release: "{{ lookup('ansible.builtin.env', 'files_to_release') }}"
+        tag_name: "{{ lookup('ansible.builtin.env', 'tag_name') }}"
+        target_branch: "{{ lookup('ansible.builtin.env', 'target_branch') }}"
+
+    - name: Create clone base directory
+      file:
+        path: "{{ destination_directory }}"
+        state: directory
+        mode: '0750'
+
+    - name: Create repo path
+      file:
+        path: "{{ destination_directory }}/{{ github_repo_name }}"
+        state: directory
+        mode: '0750'
+
+    - name: Initialize repo and checkout target branch
+      shell: |
+        set -e
+        git init
+        git remote add origin {{ github_repo_url }} 2>/dev/null || true
         git fetch origin
-        git checkout PEDI-34368_statging_artifact_testing
-        git pull origin PEDI-34368_statging_artifact_testing
-    delta: '0:00:02.524509'
-    end: '2025-05-15 15:43:46.624786'
-    msg: non-zero return code
-    rc: 128
-    start: '2025-05-15 15:43:44.100277'
-    stderr: |-
-        Already on 'PEDI-34368_statging_artifact_testing'
-        From https://github.com/department-of-veterans-affairs/fpps-build-artifacts
-         * branch            PEDI-34368_statging_artifact_testing -> FETCH_HEAD
-        hint: You have divergent branches and need to specify how to reconcile them.
-        hint: You can do so by running one of the following commands sometime before
-        hint: your next pull:
-        hint:
-        hint:   git config pull.rebase false  # merge
-        hint:   git config pull.rebase true   # rebase
-        hint:   git config pull.ff only       # fast-forward only
-        hint:
-        hint: You can replace "git config" with "git config --global" to set a default
-        hint: preference for all repositories. You can also pass --rebase, --no-rebase,
-        hint: or --ff-only on the command line to override the configured default per
-        hint: invocation.
-        fatal: Need to specify how to reconcile divergent branches.
-    stderr_lines: <omitted>
-    stdout: ''
-    stdout_lines: <omitted>
+        git fetch --tags
+        git branch -D {{ target_branch }} 2>/dev/null || true
+        if git ls-remote --heads origin {{ target_branch }} | grep {{ target_branch }}; then
+          git checkout -b {{ target_branch }} origin/{{ target_branch }}
+        else
+          git checkout -b {{ target_branch }}
+        fi
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      tags: skip_ansible_lint
 
-PLAY RECAP *******************
+    - name: Fetch develop branch
+      shell: git fetch origin develop
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      tags: skip_ansible_lint
 
+    - name: Checkout artifact files from develop branch
+      shell: |
+        git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
+      loop: "{{ files_to_release }}"
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      tags: skip_ansible_lint
 
+    - name: Stage and commit artifact files
+      shell: |
+        git add --force {{ item.artifact_folder }}/{{ item.filename }}
+        if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
+          git commit -m "{{ commit_message }}"
+        fi
+      loop: "{{ files_to_release }}"
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      tags: skip_ansible_lint
+
+    - name: Push changes to remote branch
+      shell: |
+        git pull --rebase origin {{ target_branch }} || true
+        git push origin {{ target_branch }}
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      tags: skip_ansible_lint
+
+    - name: Create and push tag if not exists
+      shell: |
+        if ! git show-ref --tags | grep -q "refs/tags/{{ tag_name }}"; then
+          git tag -a {{ tag_name }} -m "Tagging release {{ tag_name }}"
+          git push origin {{ tag_name }}
+        fi
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      tags: skip_ansible_lint
