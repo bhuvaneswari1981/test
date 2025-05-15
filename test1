@@ -1,55 +1,83 @@
     - name: promoteBuildArtifact | Promote each artifact from develop to {{ target_branch }}
-      block:
-        - name: Checkout artifact from develop
-          ansible.builtin.shell: |
-            git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          loop: "{{ files_to_release }}"
-          loop_control:
-            label: "{{ item.filename }}"
-          tags: skip_ansible_lint
-
-        - name: Commit artifact if changed
-          ansible.builtin.shell: |
-            if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
-              git add {{ item.artifact_folder }}/{{ item.filename }}
-              git commit -m "Promoting artifact for {{ tag_name }} at $(date -u +%Y-%m-%d)"
-            fi
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          loop: "{{ files_to_release }}"
-          loop_control:
-            label: "{{ item.filename }}"
-          tags: skip_ansible_lint
-
-        - name: Push committed artifacts to target branch
-          ansible.builtin.shell: |
-            git push origin {{ target_branch }}
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          tags: skip_ansible_lint
-
-        - name: Verify promoted artifacts are in remote
-          ansible.builtin.shell: |
-            git fetch origin {{ target_branch }}
-            git ls-tree -r origin/{{ target_branch }} --name-only
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: pushed_files
-          tags: skip_ansible_lint
-
-        - name: Debug list of pushed artifacts
-          debug:
-            var: pushed_files.stdout_lines
-
-    - name: promoteBuildArtifact | Create tag
+  block:
+    - name: Checkout artifact from develop
       ansible.builtin.shell: |
-        cd "{{ destination_directory }}/{{ github_repo_name }}"
-        if [ -z "$(git tag -l {{ release_tag }})" ]; then
-          git tag -a {{ release_tag }} -m "Tagging artifacts with version {{ release_tag }}"
-          git push origin {{ release_tag }}
-        else
-          echo "Tag {{ release_tag }} already exists, skipping tag creation."
+        git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      loop: "{{ files_to_release }}"
+      loop_control:
+        label: "{{ item.filename }}"
+      tags: skip_ansible_lint
+    
+    - name: Commit artifact if changed
+      ansible.builtin.shell: |
+        if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
+          git add {{ item.artifact_folder }}/{{ item.filename }}
+          git commit -m "Promoting artifact for {{ tag_name }} at $(date -u +%Y-%m-%d)"
         fi
-      tags: skip_ansible_lint 
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      loop: "{{ files_to_release }}"
+      loop_control:
+        label: "{{ item.filename }}"
+      tags: skip_ansible_lint
+    
+    - name: Push committed artifacts to target branch
+      ansible.builtin.shell: |
+        # Fetch latest changes from remote
+        git fetch origin {{ target_branch }}
+        
+        # Check if we're behind the remote
+        if git rev-list HEAD..origin/{{ target_branch }} &>/dev/null; then
+          echo "Local branch is behind remote, rebasing first..."
+          git rebase origin/{{ target_branch }}
+        fi
+        
+        # Try to push, if it fails pull and try again
+        git push origin {{ target_branch }} || (
+          echo "Push failed, trying pull with rebase and push again" && 
+          git pull --rebase origin {{ target_branch }} && 
+          git push origin {{ target_branch }}
+        )
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      register: push_result
+      failed_when: push_result.rc != 0 and 'tag already exists' not in push_result.stderr
+      tags: skip_ansible_lint
+    
+    - name: Verify promoted artifacts are in remote
+      ansible.builtin.shell: |
+        git fetch origin {{ target_branch }}
+        git ls-tree -r origin/{{ target_branch }} --name-only
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      register: pushed_files
+      tags: skip_ansible_lint
+    
+    - name: Debug list of pushed artifacts
+      debug:
+        var: pushed_files.stdout_lines
+
+- name: promoteBuildArtifact | Create tag
+  ansible.builtin.shell: |
+    cd "{{ destination_directory }}/{{ github_repo_name }}"
+    
+    # Fetch latest changes including tags
+    git fetch origin --tags
+    
+    if [ -z "$(git tag -l {{ release_tag }})" ]; then
+      git tag -a {{ release_tag }} -m "Tagging artifacts with version {{ release_tag }}"
+      
+      # Try to push the tag, with retry logic
+      git push origin {{ release_tag }} || (
+        echo "Tag push failed, fetching and trying again" &&
+        git fetch origin &&
+        git push origin {{ release_tag }} --force
+      )
+    else
+      echo "Tag {{ release_tag }} already exists, skipping tag creation."
+    fi
+  register: tag_result
+  failed_when: tag_result.rc != 0 and 'tag already exists' not in tag_result.stderr
+  tags: skip_ansible_lint
