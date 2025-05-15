@@ -1,63 +1,33 @@
-- name: promoteBuildArtifact | Promote each artifact from develop to {{ target_branch }}
-  block:
-    - name: Disable sparse checkout and configure Git
-      ansible.builtin.shell: |
-        git config core.sparseCheckout false
-        git config advice.detachedHead false
-        git config advice.updateSparsePath false
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-
-    - name: Fetch latest from remote
-      ansible.builtin.shell: |
+cmd: |-
         git fetch origin
-        git checkout {{ target_branch }}
-        git pull origin {{ target_branch }}
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+        git checkout PEDI-34368_statging_artifact_testing
+        git pull origin PEDI-34368_statging_artifact_testing
+    delta: '0:00:02.524509'
+    end: '2025-05-15 15:43:46.624786'
+    msg: non-zero return code
+    rc: 128
+    start: '2025-05-15 15:43:44.100277'
+    stderr: |-
+        Already on 'PEDI-34368_statging_artifact_testing'
+        From https://github.com/department-of-veterans-affairs/fpps-build-artifacts
+         * branch            PEDI-34368_statging_artifact_testing -> FETCH_HEAD
+        hint: You have divergent branches and need to specify how to reconcile them.
+        hint: You can do so by running one of the following commands sometime before
+        hint: your next pull:
+        hint:
+        hint:   git config pull.rebase false  # merge
+        hint:   git config pull.rebase true   # rebase
+        hint:   git config pull.ff only       # fast-forward only
+        hint:
+        hint: You can replace "git config" with "git config --global" to set a default
+        hint: preference for all repositories. You can also pass --rebase, --no-rebase,
+        hint: or --ff-only on the command line to override the configured default per
+        hint: invocation.
+        fatal: Need to specify how to reconcile divergent branches.
+    stderr_lines: <omitted>
+    stdout: ''
+    stdout_lines: <omitted>
 
-    - name: Checkout artifact from develop
-      ansible.builtin.shell: |
-        git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      loop: "{{ files_to_release }}"
-      loop_control:
-        label: "{{ item.filename }}"
-
-    - name: Commit artifact if changed
-      ansible.builtin.shell: |
-        if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
-          git add {{ item.artifact_folder }}/{{ item.filename }}
-          git commit -m "Promoting artifact {{ item.filename }} for {{ tag_name }} at $(date -u +%Y-%m-%d)"
-        fi
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      loop: "{{ files_to_release }}"
-      loop_control:
-        label: "{{ item.filename }}"
-
-    - name: Push committed artifacts to target branch
-      ansible.builtin.shell: |
-        git push origin {{ target_branch }}
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-
-    - name: Verify promoted artifacts are in remote
-      ansible.builtin.shell: |
-        git fetch origin {{ target_branch }}
-        git ls-tree -r origin/{{ target_branch }} --name-only
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      register: pushed_files
-
-    - name: Debug list of pushed artifacts
-      debug:
-        var: pushed_files.stdout_lines
-
-  rescue:
-    - name: Debug failure info
-      debug:
-        msg: "Artifact promotion failed at one of the steps."
+PLAY RECAP *******************
 
 
