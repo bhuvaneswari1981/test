@@ -1,16 +1,55 @@
-- name: promoteBuildArtifact | Remove existing directory
-  ansible.builtin.file:
-    path: "{{ destination_directory }}/{{ github_repo_name }}"
-    state: absent
+    - name: promoteBuildArtifact | Promote each artifact from develop to {{ target_branch }}
+      block:
+        - name: Checkout artifact from develop
+          ansible.builtin.shell: |
+            git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
+          args:
+            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+          loop: "{{ files_to_release }}"
+          loop_control:
+            label: "{{ item.filename }}"
+          tags: skip_ansible_lint
 
-- name: promoteBuildArtifact | Clone repository
-  ansible.builtin.git:
-    repo: "{{ destination_repo }}"
-    dest: "{{ destination_directory }}/{{ github_repo_name }}"
-    version: develop  # Use a branch that definitely exists
+        - name: Commit artifact if changed
+          ansible.builtin.shell: |
+            if [ -n "$(git status --porcelain {{ item.artifact_folder }}/{{ item.filename }})" ]; then
+              git add {{ item.artifact_folder }}/{{ item.filename }}
+              git commit -m "Promoting artifact for {{ tag_name }} at $(date -u +%Y-%m-%d)"
+            fi
+          args:
+            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+          loop: "{{ files_to_release }}"
+          loop_control:
+            label: "{{ item.filename }}"
+          tags: skip_ansible_lint
 
-- name: promoteBuildArtifact | Create target branch
-  ansible.builtin.command: git checkout -b {{ target_branch }}
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  changed_when: true
+        - name: Push committed artifacts to target branch
+          ansible.builtin.shell: |
+            git push origin {{ target_branch }}
+          args:
+            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+          tags: skip_ansible_lint
+
+        - name: Verify promoted artifacts are in remote
+          ansible.builtin.shell: |
+            git fetch origin {{ target_branch }}
+            git ls-tree -r origin/{{ target_branch }} --name-only
+          args:
+            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+          register: pushed_files
+          tags: skip_ansible_lint
+
+        - name: Debug list of pushed artifacts
+          debug:
+            var: pushed_files.stdout_lines
+
+    - name: promoteBuildArtifact | Create tag
+      ansible.builtin.shell: |
+        cd "{{ destination_directory }}/{{ github_repo_name }}"
+        if [ -z "$(git tag -l {{ release_tag }})" ]; then
+          git tag -a {{ release_tag }} -m "Tagging artifacts with version {{ release_tag }}"
+          git push origin {{ release_tag }}
+        else
+          echo "Tag {{ release_tag }} already exists, skipping tag creation."
+        fi
+      tags: skip_ansible_lint 
