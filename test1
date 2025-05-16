@@ -16,100 +16,10 @@
 
     # Process each artifact individually
     - name: Process artifacts individually
+      include_tasks: process_single_artifact.yml
       loop: "{{ files_to_release }}"
       loop_control:
         label: "{{ item.filename }}"
-      block:
-        - name: Set artifact details
-          ansible.builtin.set_fact:
-            current_artifact: "{{ item.artifact_folder }}/{{ item.filename }}"
-            commit_message: "Promoting {{ item.artifact_folder }}/{{ item.filename }} for {{ tag_name }} at {{ lookup('pipe', 'date -u +%Y-%m-%d_%H:%M:%S') }}"
-            
-        - name: Show which artifact we're processing
-          ansible.builtin.debug:
-            msg: "Processing artifact: {{ current_artifact }}"
-        
-        - name: Check if artifact exists in develop branch
-          ansible.builtin.shell: |
-            git ls-tree -r origin/develop --name-only | grep -c "{{ current_artifact }}" || echo "0"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: artifact_exists
-          changed_when: false
-          
-        - name: Fail if artifact doesn't exist
-          ansible.builtin.fail:
-            msg: "Artifact {{ current_artifact }} not found in develop branch!"
-          when: artifact_exists.stdout == "0"
-        
-        - name: Checkout the specific artifact from develop
-          ansible.builtin.shell: |
-            git checkout origin/develop -- "{{ current_artifact }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: checkout_result
-          failed_when: checkout_result.rc != 0
-          
-        - name: Check if artifact was modified
-          ansible.builtin.shell: |
-            git status --porcelain "{{ current_artifact }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: status_result
-          changed_when: false
-        
-        - name: Display status
-          ansible.builtin.debug:
-            msg: "Status of {{ current_artifact }}: {{ status_result.stdout }}"
-          
-        - name: Commit the artifact with descriptive message
-          ansible.builtin.shell: |
-            git add "{{ current_artifact }}"
-            git commit -m "{{ commit_message }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: commit_result
-          failed_when: commit_result.rc != 0 and "nothing to commit" not in commit_result.stderr and "nothing added to commit" not in commit_result.stderr
-          changed_when: commit_result.rc == 0 and "nothing to commit" not in commit_result.stderr and "nothing added to commit" not in commit_result.stderr
-        
-        - name: Display commit result
-          ansible.builtin.debug:
-            msg: "{{ commit_result.stdout_lines | default([]) + commit_result.stderr_lines | default([]) }}"
-        
-        - name: Push changes immediately after commit
-          ansible.builtin.shell: |
-            # Try to push
-            if ! git push origin {{ target_branch }}; then
-              echo "Push failed, pulling latest changes and trying again"
-              git pull --rebase origin {{ target_branch }}
-              git push origin {{ target_branch }}
-            fi
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: push_result
-          failed_when: push_result.rc != 0
-          
-        - name: Display push result
-          ansible.builtin.debug:
-            msg: "{{ push_result.stdout_lines | default([]) + push_result.stderr_lines | default([]) }}"
-        
-        - name: Verify the artifact exists in remote
-          ansible.builtin.shell: |
-            git fetch origin {{ target_branch }}
-            git ls-tree -r origin/{{ target_branch }} -- "{{ current_artifact }}" | wc -l
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: verify_result
-          failed_when: verify_result.stdout.strip() == "0"
-          
-        - name: Display verification status
-          ansible.builtin.debug:
-            msg: "Verification of {{ current_artifact }} in remote: {{ 'SUCCESS' if verify_result.stdout.strip() != '0' else 'FAILED' }}"
-      rescue:
-        - name: Handle artifact processing failure
-          ansible.builtin.debug:
-            msg: "Failed to process artifact {{ current_artifact | default('unknown') }}. See above errors."
-          failed_when: true
 
     # Create and push tag after all artifacts are processed
     - name: Create and push tag
@@ -144,3 +54,68 @@
       ansible.builtin.debug:
         msg: "Failed to promote artifacts to {{ target_branch }}. See above errors."
       failed_when: true
+
+
+- name: Checkout the specific artifact from develop
+  ansible.builtin.shell: |
+    git checkout origin/develop -- "{{ current_artifact }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: checkout_result
+  failed_when: checkout_result.rc != 0
+  
+- name: Check if artifact was modified
+  ansible.builtin.shell: |
+    git status --porcelain "{{ current_artifact }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: status_result
+  changed_when: false
+
+- name: Display status
+  ansible.builtin.debug:
+    msg: "Status of {{ current_artifact }}: {{ status_result.stdout }}"
+  
+- name: Commit the artifact with descriptive message
+  ansible.builtin.shell: |
+    git add "{{ current_artifact }}"
+    git commit -m "{{ commit_message }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: commit_result
+  failed_when: commit_result.rc != 0 and "nothing to commit" not in commit_result.stderr and "nothing added to commit" not in commit_result.stderr
+  changed_when: commit_result.rc == 0 and "nothing to commit" not in commit_result.stderr and "nothing added to commit" not in commit_result.stderr
+
+- name: Display commit result
+  ansible.builtin.debug:
+    msg: "{{ commit_result.stdout_lines | default([]) + commit_result.stderr_lines | default([]) }}"
+
+- name: Push changes immediately after commit
+  ansible.builtin.shell: |
+    # Try to push
+    if ! git push origin {{ target_branch }}; then
+      echo "Push failed, pulling latest changes and trying again"
+      git pull --rebase origin {{ target_branch }}
+      git push origin {{ target_branch }}
+    fi
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: push_result
+  failed_when: push_result.rc != 0
+  
+- name: Display push result
+  ansible.builtin.debug:
+    msg: "{{ push_result.stdout_lines | default([]) + push_result.stderr_lines | default([]) }}"
+
+- name: Verify the artifact exists in remote
+  ansible.builtin.shell: |
+    git fetch origin {{ target_branch }}
+    git ls-tree -r origin/{{ target_branch }} -- "{{ current_artifact }}" | wc -l
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: verify_result
+  failed_when: verify_result.stdout.strip() == "0"
+  
+- name: Display verification status
+  ansible.builtin.debug:
+    msg: "Verification of {{ current_artifact }} in remote: {{ 'SUCCESS' if verify_result.stdout.strip() != '0' else 'FAILED' }}"
