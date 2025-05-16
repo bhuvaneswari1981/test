@@ -1,0 +1,17 @@
+- name: Commit the artifact with descriptive message
+  shell: |
+    git add "{{ current_artifact }}"
+    git commit -m "{{ commit_message }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: commit_result
+  failed_when: >
+    commit_result.rc != 0 and
+    "'nothing to commit'" not in commit_result.stderr and
+    "'nothing added to commit'" not in commit_result.stderr and
+    "'working tree clean'" not in commit_result.stdout
+  changed_when: >
+    commit_result.rc == 0 and
+    "'nothing to commit'" not in commit_result.stderr and
+    "'nothing added to commit'" not in commit_result.stderr and
+    "'working tree clean'" not in commit_result.stdout
