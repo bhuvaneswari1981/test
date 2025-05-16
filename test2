@@ -1,0 +1,57 @@
+- name: Set vars for artifact
+  set_fact:
+    current_artifact: "{{ artifact.artifact_folder }}/{{ artifact.filename }}"
+    commit_message: "Promoting {{ artifact.artifact_folder }}/{{ artifact.filename }} for {{ tag_name }} at {{ lookup('pipe', 'date -u +%a %b %e %H:%M') }}"
+
+- name: Check artifact exists in develop
+  shell: git ls-tree -r origin/develop --name-only | grep -c "{{ current_artifact }}" || echo "0"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: artifact_exists
+  changed_when: false
+
+- name: Fail if artifact missing
+  fail:
+    msg: "Artifact {{ current_artifact }} not found in develop!"
+  when: artifact_exists.stdout == "0"
+
+- name: Checkout artifact
+  shell: git checkout origin/develop -- "{{ current_artifact }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: checkout_result
+  failed_when: checkout_result.rc != 0
+
+- name: Commit artifact
+  shell: |
+    git add "{{ current_artifact }}"
+    git commit -m "{{ commit_message }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: commit_result
+  failed_when: commit_result.rc != 0 and "nothing to commit" not in commit_result.stderr
+
+- name: Push commit
+  shell: |
+    if ! git push origin {{ target_branch }}; then
+      git pull --rebase origin {{ target_branch }}
+      git push origin {{ target_branch }}
+    fi
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: push_result
+  failed_when: push_result.rc != 0
+
+- name: Verify artifact was promoted
+  shell: |
+    git fetch origin {{ target_branch }}
+    git ls-tree -r origin/{{ target_branch }} --name-only | grep -c "{{ current_artifact }}" || echo "0"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: verify_result
+  failed_when: verify_result.stdout.strip() == "0"
+
+- name: Record failure if any
+  set_fact:
+    processing_failures: "{{ processing_failures + [artifact.filename] }}"
+  when: checkout_result.failed or commit_result.failed or push_result.failed or verify_result.failed
