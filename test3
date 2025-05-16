@@ -1,14 +1,5 @@
-- name: Commit the artifact with descriptive message
-  shell: |
-    git add "{{ current_artifact }}"
-    git commit -m "{{ commit_message }}" || echo "NO_CHANGES"
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  register: commit_result
-  changed_when: "'NO_CHANGES' not in commit_result.stdout"
-  failed_when: false
-
-- name: Log skipped commit
-  debug:
-    msg: "No changes to commit for {{ current_artifact }}"
-  when: "'NO_CHANGES' in commit_result.stdout"
+Running command npm install --location=global aws-cdk@$AWS_CDK_VERSION
+npm error code ETARGET
+npm error notarget No matching version found for aws-cdk@2.195.0.
+npm error notarget In most cases you or one of your dependencies are requesting
+npm error notarget a package version that doesn't exist.
