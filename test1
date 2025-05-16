@@ -1,104 +1,30 @@
-- name: promoteBuildArtifact | Promote each artifact from develop to {{ target_branch }}
+- name: Promote artifacts from develop to {{ target_branch }}
   hosts: localhost
   gather_facts: false
   vars:
     files_to_release:
       - { src: "fpps-web", filename: "fpps-web-568768.tar.gz", artifact_folder: "frontend" }
       - { src: "fpps-api", filename: "fpps-api-568768.tar.gz", artifact_folder: "api" }
+    processing_failures: []
+
   tasks:
 
-    - name: Ensure git repo is up to date
+    - name: Ensure repo is clean and on target branch
       ansible.builtin.shell: |
         git fetch --all
         git reset --hard origin/{{ target_branch }}
       args:
         chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      tags: skip_ansible_lint
-
-    - name: Debug files to release
-      debug:
-        msg: "Releasing files: {{ files_to_release | map(attribute='filename') | list }}"
-
-    - name: Initialize failure tracker
-      set_fact:
-        processing_failures: []
 
     - name: Promote each artifact
-      block:
-        - name: Set variables for current artifact
-          set_fact:
-            current_artifact: "{{ item.artifact_folder }}/{{ item.filename }}"
-            commit_message: "Promoting {{ item.artifact_folder }}/{{ item.filename }} for {{ tag_name }} at {{ lookup('pipe', 'date -u +%a %b %e %H:%M') }}"
-        - name: Check if artifact exists in develop
-          ansible.builtin.shell: |
-            git ls-tree -r origin/develop --name-only | grep -c "{{ current_artifact }}" || echo "0"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: artifact_exists
-          changed_when: false
-
-        - name: Fail if artifact does not exist
-          fail:
-            msg: "Artifact {{ current_artifact }} not found in develop branch!"
-          when: artifact_exists.stdout == "0"
-
-        - name: Checkout the artifact from develop
-          ansible.builtin.shell: |
-            git checkout origin/develop -- "{{ current_artifact }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: checkout_result
-          failed_when: checkout_result.rc != 0
-
-        - name: Check git status for artifact
-          ansible.builtin.shell: |
-            git status --porcelain "{{ current_artifact }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: status_result
-          changed_when: false
-
-        - name: Commit artifact
-          ansible.builtin.shell: |
-            git add "{{ current_artifact }}"
-            git commit -m "{{ commit_message }}"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: commit_result
-          failed_when: commit_result.rc != 0 and "nothing to commit" not in commit_result.stderr
-          changed_when: commit_result.rc == 0 and "nothing to commit" not in commit_result.stderr
-
-        - name: Push commit
-          ansible.builtin.shell: |
-            if ! git push origin {{ target_branch }}; then
-              git pull --rebase origin {{ target_branch }}
-              git push origin {{ target_branch }}
-            fi
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: push_result
-          failed_when: push_result.rc != 0
-
-        - name: Verify artifact in remote branch
-          ansible.builtin.shell: |
-            git fetch origin {{ target_branch }}
-            git ls-tree -r origin/{{ target_branch }} --name-only | grep -c "{{ current_artifact }}" || echo "0"
-          args:
-            chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-          register: verify_result
-          failed_when: verify_result.stdout.strip() == "0"
-
-      rescue:
-        - name: Record failed artifact
-          set_fact:
-            processing_failures: "{{ processing_failures + [item.filename] }}"
+      ansible.builtin.include_tasks: promote_single_artifact.yml
       loop: "{{ files_to_release }}"
       loop_control:
-        label: "{{ item.filename }}"
+        loop_var: artifact
 
-    - name: Fail if there were any artifact failures
-      fail:
-        msg: "Failed to promote artifacts: {{ processing_failures | join(', ') }}"
+    - name: Fail if any promotion failed
+      ansible.builtin.fail:
+        msg: "Failed to promote: {{ processing_failures | join(', ') }}"
       when: processing_failures | length > 0
 
     - name: Tag the release
@@ -109,12 +35,12 @@
           git tag -a {{ release_tag }} -m "Tagging artifacts with version {{ release_tag }}"
           git push origin {{ release_tag }} || git push origin {{ release_tag }} --force
         else
-          echo "Tag {{ release_tag }} already exists, skipping"
+          echo "Tag {{ release_tag }} already exists"
         fi
       register: tag_result
       failed_when: tag_result.rc != 0 and 'already exists' not in tag_result.stderr
 
-    - name: Verify tag exists
+    - name: Confirm tag exists in remote
       ansible.builtin.shell: |
         git ls-remote --tags origin | grep -c "{{ release_tag }}" || echo "0"
       args:
