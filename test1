@@ -1,1 +1,47 @@
+- name: promoteBuildArtifact | Check if each file exists in develop branch
+  ansible.builtin.shell: |
+    git ls-tree --name-only origin/develop {{ item.artifact_folder }}/{{ item.filename }}
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  register: check_files
+  loop: "{{ files_to_release }}"
+  changed_when: false
+  failed_when: check_files.results | selectattr('stdout', 'equalto', '') | list | length > 0
+  tags: skip_ansible_lint
+
+- name: promoteBuildArtifact | Checkout files from develop branch
+  ansible.builtin.shell: >
+    git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  loop: "{{ files_to_release }}"
+  tags: skip_ansible_lint
+
+- name: promoteBuildArtifact | Group files by artifact_folder
+  ansible.builtin.set_fact:
+    files_by_folder: "{{ files_by_folder | default({}) | combine({ item.artifact_folder: (files_by_folder[item.artifact_folder] | default([])) + [item.filename] }) }}"
+  loop: "{{ files_to_release }}"
+
+- name: promoteBuildArtifact | Commit changes by artifact folder
+  ansible.builtin.shell: |
+    cd "{{ destination_directory }}/{{ github_repo_name }}"
+    git add {{ item.value | map('regex_replace', '^', item.key + '/') | join(' ') }}
+    git_status=$(git status --porcelain)
+    if [ -n "$git_status" ]; then
+      git commit -m "Promote {{ item.key }} artifacts - {{ lookup('pipe', 'date +%Y-%m-%d') }}"
+    fi
+  loop: "{{ files_by_folder | dict2items }}"
+  when: item.value | length > 0
+  tags: skip_ansible_lint
+
+- name: promoteBuildArtifact | Tag and push changes
+  ansible.builtin.shell: |
+    cd "{{ destination_directory }}/{{ github_repo_name }}"
+    if [ -z "$(git tag -l {{ release_tag }})" ]; then
+      git tag -a {{ release_tag }} -m "Tagging artifacts with version {{ release_tag }}"
+    fi
+    git push origin {{ target_branch }} --tags || (git fetch origin && git push origin {{ target_branch }} --tags --force)
+  register: git_push
+  failed_when: git_push.rc != 0 and 'tag already exists' not in git_push.stderr
+  tags: skip_ansible_lint
 
