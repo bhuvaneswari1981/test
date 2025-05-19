@@ -1,4 +1,4 @@
-failed: [vac10webfpp820.va.gov] (item=frontend/fpps-web-2.2.1-457d251-106.tar.gz) => 
+
     ansible_loop_var: item
     changed: false
     cmd: |-
@@ -21,7 +21,7 @@ failed: [vac10webfpp820.va.gov] (item=frontend/fpps-web-2.2.1-457d251-106.tar.gz
     stderr_lines: <omitted>
     stdout: frontend/fpps-web-2.2.1-457d251-106.tar.gz
     stdout_lines: <omitted>
-failed: [vac10webfpp820.va.gov] (item=api/fpps-api-2.2.1-c5ac45f-72.tar.gz) => 
+
     ansible_loop_var: item
     changed: false
     cmd: |-
@@ -44,7 +44,7 @@ failed: [vac10webfpp820.va.gov] (item=api/fpps-api-2.2.1-c5ac45f-72.tar.gz) =>
     stderr_lines: <omitted>
     stdout: api/fpps-api-2.2.1-c5ac45f-72.tar.gz
     stdout_lines: <omitted>
-failed: [vac10webfpp820.va.gov] (item=backend/fpps-backend-2.2.1-d647bf4-122.war) => 
+
     ansible_loop_var: item
     changed: false
     cmd: |-
