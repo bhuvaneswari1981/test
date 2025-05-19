@@ -1,16 +1,26 @@
+- name: promoteBuildArtifact | Commit and push each artifact folder with proper message
+  ansible.builtin.shell: |
+    set -e
+    cd "{{ destination_directory }}/{{ github_repo_name }}"
+    git checkout {{ target_branch }}
 
-    - name: promoteBuildArtifact | Fail if any files are missing in develop
-  ansible.builtin.fail:
-    msg: "The following files are missing in develop branch: {{ missing_files | join(', ') }}"
-  when: missing_files | length > 0
-  vars:
-    missing_files: >-
-      {{
-        check_files.results
-        | selectattr('stdout', 'equalto', '')
-        | map(attribute='item')
-        | map('combine', {'path': item.artifact_folder ~ '/' ~ item.filename})
-        | map(attribute='path')
-        | list
-      }}
+    FOLDER="{{ item }}"
+    FILES=$(find "$FOLDER" -type f)
+    COMMIT_MSG="fpps_promotebuildartifacts_{{ release_tag }}_{{ lookup('pipe', 'date +%Y%m%d') }}"
 
+    if [ -n "$FILES" ]; then
+      git add $FILES
+      if git diff --cached --quiet; then
+        echo "No changes to commit in $FOLDER"
+      else
+        git commit -m "$COMMIT_MSG"
+      fi
+    fi
+  loop: "{{ files_to_release | map(attribute='artifact_folder') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+  args:
+    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+  tags: skip_ansible_lint
+
+  
