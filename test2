@@ -1,71 +1,16 @@
 
-    ansible_loop_var: item
-    changed: false
-    cmd: |-
-        git ls-tree --name-only origin/develop frontend/fpps-web-2.2.1-457d251-106.tar.gz
-    delta: '0:00:00.041124'
-    end: '2025-05-19 15:50:40.464600'
-    failed_when_result: 'The conditional check ''check_files.results | selectattr(''stdout'',
-        ''equalto'', '''') | list | length > 0'' failed. The error was: error while evaluating
-        conditional (check_files.results | selectattr(''stdout'', ''equalto'', '''') |
-        list | length > 0): ''dict object'' has no attribute ''results''. ''dict object''
-        has no attribute ''results'''
-    item:
-        artifact_folder: frontend
-        filename: fpps-web-2.2.1-457d251-106.tar.gz
-        src: fpps-web
-    msg: ''
-    rc: 0
-    start: '2025-05-19 15:50:40.423476'
-    stderr: ''
-    stderr_lines: <omitted>
-    stdout: frontend/fpps-web-2.2.1-457d251-106.tar.gz
-    stdout_lines: <omitted>
+    - name: promoteBuildArtifact | Fail if any files are missing in develop
+  ansible.builtin.fail:
+    msg: "The following files are missing in develop branch: {{ missing_files | join(', ') }}"
+  when: missing_files | length > 0
+  vars:
+    missing_files: >-
+      {{
+        check_files.results
+        | selectattr('stdout', 'equalto', '')
+        | map(attribute='item')
+        | map('combine', {'path': item.artifact_folder ~ '/' ~ item.filename})
+        | map(attribute='path')
+        | list
+      }}
 
-    ansible_loop_var: item
-    changed: false
-    cmd: |-
-        git ls-tree --name-only origin/develop api/fpps-api-2.2.1-c5ac45f-72.tar.gz
-    delta: '0:00:00.036039'
-    end: '2025-05-19 15:50:41.729561'
-    failed_when_result: 'The conditional check ''check_files.results | selectattr(''stdout'',
-        ''equalto'', '''') | list | length > 0'' failed. The error was: error while evaluating
-        conditional (check_files.results | selectattr(''stdout'', ''equalto'', '''') |
-        list | length > 0): ''dict object'' has no attribute ''results''. ''dict object''
-        has no attribute ''results'''
-    item:
-        artifact_folder: api
-        filename: fpps-api-2.2.1-c5ac45f-72.tar.gz
-        src: fpps-api
-    msg: ''
-    rc: 0
-    start: '2025-05-19 15:50:41.693522'
-    stderr: ''
-    stderr_lines: <omitted>
-    stdout: api/fpps-api-2.2.1-c5ac45f-72.tar.gz
-    stdout_lines: <omitted>
-
-    ansible_loop_var: item
-    changed: false
-    cmd: |-
-        git ls-tree --name-only origin/develop backend/fpps-backend-2.2.1-d647bf4-122.war
-    delta: '0:00:00.035719'
-    end: '2025-05-19 15:50:42.960813'
-    failed_when_result: 'The conditional check ''check_files.results | selectattr(''stdout'',
-        ''equalto'', '''') | list | length > 0'' failed. The error was: error while evaluating
-        conditional (check_files.results | selectattr(''stdout'', ''equalto'', '''') |
-        list | length > 0): ''dict object'' has no attribute ''results''. ''dict object''
-        has no attribute ''results'''
-    item:
-        artifact_folder: backend
-        filename: fpps-backend-2.2.1-d647bf4-122.war
-        src: fpps-backend
-    msg: ''
-    rc: 0
-    start: '2025-05-19 15:50:42.925094'
-    stderr: ''
-    stderr_lines: <omitted>
-    stdout: backend/fpps-backend-2.2.1-d647bf4-122.war
-    stdout_lines: <omitted>
-ERROR! Unexpected Exception, this is probably a bug: unsupported operand type(s) for |=: 'bool' and 'AnsibleUnsafeText'
-to see the full traceback, use -vvv
