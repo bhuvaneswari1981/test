@@ -1,12 +1,10 @@
-- name: promoteBuildArtifact | Checkout artifacts from develop branch
-  ansible.builtin.shell: >
-    git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
-  args:
-    chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-  loop: "{{ files_to_release }}"
-  loop_control:
-    label: "{{ item.artifact_folder }}/{{ item.filename }}"
-  register: checkout_results
-  failed_when: checkout_results.results is defined and
-               (checkout_results.results | selectattr('rc', '!=', 0) | list | length > 0)
-  tags: skip_ansible_lint
+name: promoteBuildArtifact | Checkout artifacts from develop branch
+      ansible.builtin.shell: >
+        git ls-tree --name-only origin/develop {{ item.artifact_folder }}/{{ item.filename }} && 
+        git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
+      args:
+        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
+      register: checkout_result
+      loop: "{{ files_to_release }}"
+      failed_when: checkout_result.rc != 0
+      tags: skip_ansible_lint
