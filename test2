@@ -1,10 +1,11 @@
-name: promoteBuildArtifact | Checkout artifacts from develop branch
-      ansible.builtin.shell: >
-        git ls-tree --name-only origin/develop {{ item.artifact_folder }}/{{ item.filename }} && 
-        git checkout origin/develop -- {{ item.artifact_folder }}/{{ item.filename }}
-      args:
-        chdir: "{{ destination_directory }}/{{ github_repo_name }}"
-      register: checkout_result
-      loop: "{{ files_to_release }}"
-      failed_when: checkout_result.rc != 0
+- name: promoteBuildArtifact | Commit artifacts
+      ansible.builtin.shell: |
+        cd "{{ destination_directory }}/{{ github_repo_name }}"
+        git add .
+        git_status=$(git status --porcelain)
+        if [ -n "$git_status" ]; then
+          git commit -m "fpps_promoteBuildArtifacts_{{ release_tag }}"
+        fi
+      register: git_commit
+      changed_when: "'nothing to commit' not in git_commit.stdout"
       tags: skip_ansible_lint
