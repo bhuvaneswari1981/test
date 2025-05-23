@@ -1,11 +1,1 @@
-- name: promoteBuildArtifact | Commit artifacts
-      ansible.builtin.shell: |
-        cd "{{ destination_directory }}/{{ github_repo_name }}"
-        git add .
-        git_status=$(git status --porcelain)
-        if [ -n "$git_status" ]; then
-          git commit -m "fpps_promoteBuildArtifacts_{{ release_tag }}"
-        fi
-      register: git_commit
-      changed_when: "'nothing to commit' not in git_commit.stdout"
-      tags: skip_ansible_lint
+
