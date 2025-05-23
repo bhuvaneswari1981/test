@@ -1,1 +1,81 @@
 
+    - name: deployFPPSWeb | Get archive from github
+      include_tasks: ../tasks/getGITHUBArtifact.yml
+      when: not deployment_filename.startswith("frontend")
+
+    - name: deployFPPSWeb | Get archive from buildartifacts
+      include_tasks: ../tasks/sparse_checkout.yml
+      vars:
+        github_repo_name: "fpps-build-artifacts"
+        sparse_checkout: "{{ deployment_filename }}"
+        base_dir: "/opt/tmp"
+      when: deployment_filename.startswith("frontend")
+
+    - name: deployFPPSWeb | Inspect {{ deployment_filename }}
+      shell: |
+        set -o pipefail
+        unzip -l {{ archive_name.dest }} | grep .tar.gz | wc -l
+      register: unzip_content 
+
+    - name: deployFPPSWeb | Unarchive {{ deployment_filename }}
+      unarchive:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ local_stage_path }}"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
+      register: unarchive_file
+      when: unzip_content.stdout | int > 1
+
+    - name: deployFPPSWeb | Copy {{ deployment_filename }} to {{ local_stage_path }}
+      copy:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ local_stage_path }}"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
+      register: war_contents
+      when: unzip_content.stdout | int < 2
+    - name: deployFPPSWeb | Determine if there is an existing release
+      stat:
+        path: "{{ release_path }}"
+      register: fpps_stat
+
+    - name: deployFPPSWeb | Create backup of existing release
+      synchronize:
+        src: "{{ release_path }}"
+        dest: "{{ fpps_backup }}"
+        recursive: yes
+        perms: yes
+        owner: true
+        group: true
+        rsync_path: "sudo rsync" #use sudo on the remote systems
+      delegate_to: "{{ inventory_hostname }}"
+      when: fpps_stat.stat.exists
+
+    - name: deployFPPSWeb | Ensure "{{ release_path }}" exists
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ fpps_default_user_name }}"
+        group: "{{ fpps_default_user_group }}"
+        mode: 0750
+      with_items:
+        - "{{ release_path }}"
+      when: not fpps_stat.stat.exists
+
+    - name: deployFPPSWeb | Extract tar to  {{ release_path }}
+      command: "tar -xvf {{ local_stage_path }}/{{ deployment_tar_file.split('/')[-1] }} -C {{ release_path }}/"
+      when: unzip_content.stdout | int > 1
+      tags:
+        - skip_ansible_lint
+
+    - name: deployFPPSWeb | Synchronize app source
+      synchronize:
+        src: "{{ tmp_path }}/"
+        dest: "{{ release_path }}/"
+        recursive: yes
+        owner: no
+        group: no
+        delete: yes
+        rsync_path: "sudo rsync" #use sudo on the remote systems
+      delegate_to: "{{ inventory_hostname }}"
+      when: unzip_content.stdout | int < 2
