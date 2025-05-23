@@ -1,1 +1,65 @@
+---
+# will sparse checkout:
+# github_repo_url: repo to clone
+# sparse_checkout: path/to/folder or file to checkout
+# base_dir: where to clone
+- name: sparse_checkout | Install git-lfs, likely will be needed
+  ansible.builtin.package:
+    name: git-lfs
+    state: present
+  failed_when: false
 
+- name: sparse_checkout | Set needed facts for ansible sparse checkout
+  vars:
+    build_user: "{{ lookup('ansible.builtin.env', 'BUILDUSER') }}"
+    build_token: "{{ lookup('ansible.builtin.env', 'BUILDTOKEN') }}"
+  set_fact:
+    github_repo_url: "https://{{ build_user }}:{{ build_token }}@github.com/department-of-veterans-affairs/{{ github_repo_name }}"
+
+- name: sparse_checkout | Cleanup dir for sparse checkout
+  ansible.builtin.file:
+    path: "{{ base_dir }}"
+    state: absent
+
+- name: sparse_checkout | Create dir for sparse checkout
+  ansible.builtin.file:
+    path: "{{ base_dir }}"
+    state: directory
+    mode: 0750
+
+- name: sparse_checkout | Clone code
+  ansible.builtin.shell: |
+    set -o pipefail;
+    rm {{ sparse_checkout }} >/dev/null 2>&1;
+    git lfs install;
+    git clone {{ github_repo_url }} -n --depth 1 --branch {{ branch  | default('develop') }};
+  args:
+    chdir: "{{ base_dir }}"
+
+- name: sparse_checkout | Sparse checkout {{ sparse_checkout }}
+  ansible.builtin.shell: |
+    set -o pipefail;
+    git sparse-checkout init --cone
+    git sparse-checkout set "{{ sparse_checkout }}"
+    git checkout
+    git lfs pull -I "{{ sparse_checkout }}"
+  args:
+    chdir: "{{ base_dir + '/' + github_repo_name }}"
+  register: checkout_results
+  failed_when: >
+    'Skipped checkout' in checkout_results.stderr
+
+- name: sparse_checkout | Verify checkout {{ sparse_checkout }}
+  ansible.builtin.stat:
+    path: "{{ (base_dir, github_repo_name, sparse_checkout) | path_join }}"
+  register: local_download
+  failed_when:
+    - not local_download.stat.exists
+
+- name: sparse_checkout | Get download URL for matching artifact
+  set_fact:
+    archive_name: {url: "{{ github_repo_url }}", dest: "{{ (base_dir, github_repo_name, sparse_checkout) | path_join }}"}
+
+- name: sparse_checkout | Show archive location
+  debug:
+    var: archive_name
