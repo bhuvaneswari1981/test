@@ -1,405 +1,102 @@
----
-# create/check release folder
-# copy public to remote folder
-- name: deployFPPSWeb | Deploy FPPS Web site
-  hosts: "{{ var_hosts }}"
-  gather_facts: true
-  remote_user: "{{ ansible_ssh_user }}"
-  become: true
+# pylint: disable=redefined-builtin,f-string-without-interpolation,too-many-positional-arguments,no-else-return
+import os
+from aws_cdk import (
+  Stack,
+  NestedStack,
+  App,
+  Environment,
+  CfnOutput,
+  Fn,
+  DefaultStackSynthesizer
+)
+from common.utility.paramstore_util import ParamStoreUtil
+from common.lambdas.layers.default.custom_logger import logger
 
-  roles:
-    - ansible-role-awscli
+def get_export_name(export_name, resource_type):
+  export_name = export_name.replace("-", "").replace("_", "")
+  if resource_type == "AWS::Batch::JobDefinition":
+    return f"{export_name}job"
+  elif resource_type == "AWS::StepFunctions::StateMachine":
+    return f"{export_name}sfn"
+  elif resource_type == "AWS::Lambda::Function":
+    return f"{export_name}lambda"
+  elif resource_type == "AWS::ElasticLoadBalancingV2::LoadBalancer":
+    return f"{export_name}loadbalancer"
+  else:
+    return export_name
 
-  vars:
-    stage_path: ""
-    app_name: fpps-web
-    deployment_filename: "{{ lookup('ansible.builtin.env', 'deployment_filename') }}"
-    github_project_repo: fpps-web
-    local_stage_path: "{{ ansible_env.HOME }}/releases/{{ app_name }}"
-    release_path: "{{ fpps_default_user_home }}/{{ app_name }}"
-    tmp_path: "{{ ansible_env.HOME }}/releases/{{ app_name }}"
-    backup_path: "{{ ansible_env.HOME }}/releases/backups"
-    backup_to_keep: 10
-    date_string: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+def set_stack_output(scope, id, value, export_name, resource_type=None):
+  CfnOutput(scope, id, value=value, export_name=get_export_name(export_name, resource_type))
 
-  pre_tasks:
-    - name: deployFPPSWeb | Include all files in vars
-      include_vars:
-        dir: ../vars/fpps-defaults
-        extensions:
-          - yml
+def import_stack_export(export_name, resource_type=None):
+  return Fn.import_value(get_export_name(export_name, resource_type))
 
-    - name: deployFPPSWeb | Include playbook pre tasks
-      include_tasks: ../tasks/playbookPreTasks.yml
+def stack_synthesizer(env):
+  iam_arn = f"arn:${{AWS::Partition}}:iam::${{AWS::AccountId}}:role/project"
+  project_env = f"project-{env}"
+  logger.info("env: %s, project_env %s", env, project_env)
+  synthesizer=DefaultStackSynthesizer(
+    qualifier=env,
+    file_assets_bucket_name=f"cdktoolkit-stagingbucket-{env}",
+    image_assets_repository_name="cdk-{project_env}-container-assets",
+    deploy_role_arn=f"{iam_arn}/{project_env}-ped-cdk-deploy-role",
+    file_asset_publishing_role_arn=f"{iam_arn}/{project_env}-ped-cdk-file-publishing-role",
+    image_asset_publishing_role_arn=f"{iam_arn}/{project_env}-ped-cdk-image-publishing-role",
+    cloud_formation_execution_role=f"{iam_arn}/{project_env}-ped-cdk-cfn-exec-role",
+    lookup_role_arn=f"{iam_arn}/{project_env}-ped-cdk-lookup-role",
+    bootstrap_stack_version_ssm_parameter=f"/cdk-bootstrap/{project_env}/version",
+    generate_bootstrap_version_rule=True)
+  return synthesizer
 
-  tasks:
-    - name: deployFPPSWeb | Create FPPS USER group(s)
-      group:
-        state: present
-        name: "{{ fpps_default_user_group }}"
+class PEDStack(Stack):
 
-    - name: deployFPPSWeb | Create FPPS USER
-      user:
-        state: present
-        name: "{{ fpps_default_user_name }}"
-        home: "{{ fpps_default_user_home }}"
-        group: "{{ fpps_default_user_group }}"
-        create_home: true
-        comment: "FPPS user"
+  def __init__(self, app: App, id: str, ped_config, ped_props, **kwargs) -> None:
+    self.ped_config = ped_config
+    self.ped_props = ped_props
+    self.stack_synthesizer = stack_synthesizer(env=self.ped_props.real_app_env)
+    self.cloud_env = Environment(account=str(self.ped_config['aws_account_id']), region=self.ped_config['aws_region'])
+    self.logger = logger
+    self.add_param_store_config()
+    super().__init__(app, id, env=self.cloud_env, synthesizer=self.stack_synthesizer, **kwargs)
 
-    - name: deployFPPSWeb | Create rc files for Jenkins user to access Nexus
-      template:
-        src: ../templates/nexus/npmrc.j2 # noqa no-relative-paths
-        dest: "{{ item.dest }}"
-        owner: "{{ item.owner }}"
-        group: "{{ item.group }}"
-        mode: "{{ item.mode }}"
-        backup: yes
-      loop:
-        - { dest: "{{ jenkins_home }}/.npmrc", owner: "{{ jenkins_process_user }}", group: "{{ jenkins_process_group }}", mode: '0644' }
-        - { dest: "{{ fpps_default_user_home }}/.npmrc", owner: "{{ fpps_default_user_name }}", group: "{{ fpps_default_user_group }}", mode: '0644' }
-        - { dest: "/root/.npmrc", owner: "root", group: "root", mode: '0644' }
-      loop_control:
-        label: "Create {{ item.dest }}"
+  #Override the logical id for root stacks to clean up the stack name and make it less redundant.
+  def get_logical_id(self, element):
+    logical_id = super().get_logical_id(element)
+    if self.ped_props.is_root_stack and 'NestedStackResource' in element.node.id:
+      logical_id = element.node.id.split(".")[0].replace("-", "")
+    return logical_id
 
-    - name: deployFPPSWeb | Create backup filename
-      set_fact:
-        fpps_backup: "{{ backup_path }}/{{ app_name }}_bkp_{{ date_string }}"
+  #Read in the param store files and store them in ped_config as a dictionary to be referenced at stack creation time
+  def add_param_store_config(self):
+    source_dir = self.ped_props.source_dir
+    param_store_path = f"{source_dir}/environments/{self.ped_props.env_dir}/group_vars/all/param-store"
+    if not os.path.exists(param_store_path):
+      logger.info("%s does not exist, moving on",param_store_path)
+      return
+    for file in os.scandir(param_store_path):
+      if "-template" not in file.name:
+        transaction_name = file.name.split(".")[0]
+        paramstore_path = f"{param_store_path}/{transaction_name}.json"
+        flattened_json = ParamStoreUtil.flatten_json(paramstore_path, f"/{self.ped_props.app_env}/")
+        self.ped_config[f"{transaction_name}-param-store"] = flattened_json
 
-    - name: deployFPPSWeb | Ensure directories exists
-      file:
-        path: "{{ item }}"
-        state: directory
-        mode: 0755
-      with_items:
-        - "{{ tmp_path }}"
-        - "{{ backup_path }}"
-        - "{{ ansible_env.HOME }}/releases"
-        - /var/log/deployments
+  def set_stack_output(self, scope, id, value, export_name, resource_type=None):
+    set_stack_output(scope, id, value, export_name, resource_type)
 
-    - name: deployFPPSWeb | Ensure deployment logging for staging server exists
-      file:
-        path: "{{ item.src }}"
-        state: directory
-        owner: root
-        group: root
-        mode: 0755
-      with_items:
-        - { src: /var/log/deployments }
+  def import_stack_export(self, export_name, resource_type=None):
+    return import_stack_export(export_name, resource_type)
 
-    - name: deployFPPSWeb | Get artifact branch
-      set_fact:
-        artifact_branch: "{{ 'develop' if app_env in ['dev','test'] else 'master' }}"
+class PEDNestedStack(NestedStack):
 
-    - name: deployFPPSWeb | Get archive from buildartifacts
-      include_tasks: ../tasks/sparse_checkout.yml
-      vars:
-        github_repo_name: "fpps-build-artifacts"
-        sparse_checkout: "{{ deployment_filename }}"
-        base_dir: "/opt/tmp"
-        branch: "{{ artifact_branch }}"
+  def __init__(self, app: App, id: str, ped_config, ped_props, **kwargs) -> None:
+    self.ped_config = ped_config
+    self.ped_props = ped_props
+    self.logger = logger
+    super().__init__(app, id, **kwargs)
 
-    - name: deployARSWeb | Unarchive {{ deployment_filename }}
-      unarchive:
-        src: "{{ archive_name.dest }}"
-        dest: "{{ local_stage_path }}"
-        remote_src: true
-      delegate_to: "{{ inventory_hostname }}"
+  def set_stack_output(self, scope, id, value, export_name, resource_type=None):
+    set_stack_output(scope, id, value, export_name, resource_type)
 
-    - name: deployFPPSWeb | Determine if there is an existing release
-      stat:
-        path: "{{ release_path }}"
-      register: fpps_stat
-
-    - name: deployFPPSWeb | Create backup of existing release
-      synchronize:
-        src: "{{ release_path }}"
-        dest: "{{ fpps_backup }}"
-        recursive: yes
-        perms: yes
-        owner: true
-        group: true
-        rsync_path: "sudo rsync" #use sudo on the remote systems
-      delegate_to: "{{ inventory_hostname }}"
-      when: fpps_stat.stat.exists
-
-    - name: deployFPPSWeb | Ensure "{{ release_path }}" exists
-      file:
-        path: "{{ item }}"
-        state: directory
-        owner: "{{ fpps_default_user_name }}"
-        group: "{{ fpps_default_user_group }}"
-        mode: 0750
-      with_items:
-        - "{{ release_path }}"
-
-    - name: deployFPPSWeb | Synchronize app source
-      synchronize:
-        src: "{{ tmp_path }}/"
-        dest: "{{ release_path }}/"
-        recursive: yes
-        owner: no
-        group: no
-        delete: yes
-        rsync_path: "sudo rsync" #use sudo on the remote systems
-      delegate_to: "{{ inventory_hostname }}"
-
-    - name: deployFPPSWeb | Add proxy location files to the httpd conf.d directory
-      template:
-        src: "../templates/fpps/{{ item }}"
-        dest: "/etc/httpd/conf.d/{{ item | basename | regex_replace ('.j2$','') }}"
-        mode: 0644
-        backup: true
-      notify: reload_httpd
-      loop:
-        - fpps-web.vhost.conf.j2
-        - fpps-nodeapi.vhost.conf.j2
-      tags:
-        - skip_ansible_lint
-
-    - name: deployFPPSWeb | Get FPPS Site Meta Data
-      command: cat "{{ release_path }}/index.html"
-      register: index_meta_data
-      tags: find_meta
-      changed_when: false
-
-    - name: deployFPPSWeb | Set distributionVersionDeployed
-      set_fact:
-        distributionVersionDeployed: "{{ index_meta_data.stdout | regex_search(regexp, '\\1')| regex_replace('\\s+','') }}"
-      vars:
-        regexp: '<meta name=\"version\"\s+content=\"([^>]+)\"'
-      tags:
-        - skip_ansible_lint
-        - find_meta
-
-    - name: deployFPPSWeb | Set distributionFileDeployed
-      set_fact:
-        distributionFileDeployed: "{{ index_meta_data.stdout | regex_search(regexp, '\\1') }}"
-      vars:
-        regexp: '<meta name=\"distributionFileName\"\s+content=\"([^>]+)\"'
-      tags: find_meta
-
-    - name: deployFPPSWeb | Set lastBuildDate
-      set_fact:
-        lastBuildDate: "{{ index_meta_data.stdout | regex_search(regexp, '\\1') }}"
-      vars:
-        regexp: '<meta name=\"lastBuildDate\"\s+content=\"([^>]+)\"'
-      tags: find_meta
-
-    - name: deployFPPSWeb | Output meta
-      debug:
-        msg: "{{ distributionVersionDeployed }}, {{ distributionFileDeployed }}, {{ lastBuildDate }}"
-      tags: find_meta
-
-    - name: deployFPPSWeb | Update FPPS env
-      template:
-        src: "../templates/fpps/{{ item.src }}"
-        dest: "{{ item.dest }}"
-        mode: 0644
-        owner: "{{fpps_default_user_name }}"
-        group: "{{ fpps_default_user_group }}"
-        backup: yes
-      delegate_to: "{{ inventory_hostname }}"
-      with_items:
-        - src: "{{ app_name }}.environment.json.j2"
-          dest: "{{ release_path }}/assets/config/environment.json"
-        - src: "{{ app_name }}.htaccess.j2"
-          dest: "{{ release_path }}/assets/.htaccess"
-
-    - name: deployFPPSWeb | Check if aws cw agent path exists
-      stat:
-        path: "{{ aws_cwagent_install_path }}"
-      register: aws_cwagent_present
-
-    - name: deployFPPSWeb | Update Cloudwatch Agent files
-      template:
-        src: "../templates/fpps/{{ app_name }}-cwagent-logs.json.j2"
-        dest: "{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json"
-        mode: 0755
-        owner: "root"
-        group: "root"
-      delegate_to: "{{ inventory_hostname }}"
-      failed_when: false
-      when: aws_cwagent_present.stat.exists
-
-    ###############################################
-    ### append configure cloudwatch agent to ship logs ###
-    ###############################################
-    - name: deployFPPSWeb | Append the new config to start command
-      command: >
-        {{ aws_cwagent_ctl }}
-        -a append-config -m {{ aws_cwagent_mode }}
-        -c file:'{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json'
-        -s
-      notify: get_cwagent_status
-
-    - name: deployFPPSWeb | Make {{ release_path }} tree readable
-      file:
-        path: "{{ release_path }}"
-        mode: 0755
-        owner: "{{ fpps_default_user_name }}"
-        group: "{{ fpps_default_user_group }}"
-        recurse: yes
-
-    - name: deployFPPSWeb | Make {{ fpps_default_user_home }} tree readable by apache
-      acl:
-        path: "{{ fpps_default_user_home }}"
-        entity: apache
-        etype: user
-        permissions: rx
-        state: present
-        recursive: yes
-
-    - name: deployFPPSWeb | Ensure we start with a clean SELinux file context of {{ release_path }}
-      community.general.sefcontext:
-        path: '{{ release_path }}(/.*)?'
-        setype: httpd_sys_content_t
-        state: absent
-
-    - name: deployFPPSWeb | Set SELinux file context of {{ release_path }}
-      community.general.sefcontext:
-        path: '{{ release_path }}(/.*)?'
-        setype: httpd_sys_content_t
-        state: present
-        reload: true
-      register: content
-
-    - name: deployFPPSWeb | Reload_selinux
-      command: restorecon -Rv {{ item }}
-      with_items:
-      - "{{ release_path }}"
-      changed_when: false
-
-    - name: deployFPPSWeb | Verify index page on site
-      uri:
-        url: "{{ fpps_site_url }}"
-        status_code: 200
-        validate_certs: false
-        return_content: yes
-      register: site_index
-      tags: find_meta
-      until: site_index is not failed
-      retries: 30
-      delay: 15
-      changed_when: true
-
-    - name: deployFPPSWeb | Is site being redirected to PIV
-      debug:
-        msg: "site is redireced to PIV login {{ site_index.redirected }}"
-      tags: find_meta
-
-    - name: deployFPPSWeb | URL of site query
-      debug:
-        msg: "site url returned {{ site_index.url }}"
-      tags: find_meta
-
-    - name: deployFPPSWeb | Parse our site from string if redirected
-      set_fact:
-        site_url: "{{ site_index.url | regex_replace(regexp, '\\1://\\3.\\4.\\5/') }}"
-      vars:
-        regexp: '.*TARGET=.*(http[s]*)(%.{2}){3}(.*)%.{2}(.*)%.{2}(.*)%.{2}.*'
-      when: site_index.redirected
-      tags: find_meta
-
-    - name: deployFPPSWeb | Parse our site from string if not redirected
-      set_fact:
-        site_url: "{{ site_index.url }}"
-      when: not site_index.redirected
-      tags: find_meta
-
-    - name: deployFPPSWeb | Get the username running the deploy
-      command: whoami
-      register: username_on_the_host
-      changed_when: False
-      become: no
-      tags: find_meta
-
-    - name: deployFPPSWeb | Update server deployment history
-      lineinfile:
-        dest: "/var/log/deployments/{{ app_name }}_{{ env }}_deploymentHistory.log"
-        line: >
-          "{{ site_index.date }},
-          {{ username_on_the_host.stdout }},
-          {{ site_url }},
-          {{ distributionVersionDeployed[0] }},
-          {{ distributionFileDeployed[0] }}"
-        create: yes
-        insertafter: EOF
-        state: present
-        mode: 0644
-      tags: find_meta
-
-    - name: deployFPPSWeb | Send Email to users
-      community.general.mail:
-        subject: "Deployment completed for FPPS WEB {{ env | upper }}"
-        body: "{{ lookup('template','../templates/fpps/deployment_notification_body.j2') }}"
-        from: jenkins@{{ inventory_hostname }} (AWS Automation)
-        to: "{{ fpps_fe_notification_list }}"
-        cc:
-          - "{{ default_reply_email }}"
-        headers:
-          - Reply-To="{{ default_reply_email }}"
-          - X-Special="Notification for deployment"
-        subtype: html
-      vars:
-        paragraph1: "Deployment env: {{ friendly_env }}"
-        paragraph2: |
-           Deployed Date: {{ date_string }}<br>
-           URL: {{ fpps_webui_url }}<br>
-           Status: {{ site_index.status }}<br>
-           Last Build Date: {{ lastBuildDate[0] }}<br>
-           Distribution Version: {{ distributionVersionDeployed[0] }}<br>
-           Distribution File Deployed: {{ distributionFileDeployed[0] }}<br>
-      failed_when: false
-      tags: skip_ansible_lint
-
-    - name: deployFPPSWeb | Cleanup unarchived files
-      file:
-        path: "{{ tmp_path }}"
-        state: absent
-
-    - name: deployFPPSWeb | Collect list of backups elibible for cleanup
-      shell: |
-        set -o pipefail;
-        ls -t {{ backup_path }} | grep {{ app_name }}_bkp_ | tail -n +{{ backup_to_keep + 1 }}
-      register: ls_output
-      become: true
-      changed_when: false
-      failed_when: ls_output.rc > 1
-
-    - name: deployFPPSWeb | Remove backups eligible for cleanup
-      file:
-        path: "{{ backup_path }}/{{ item }}"
-        state: absent
-      with_items: "{{ ls_output.stdout_lines }}"
-      become: true
-      when:
-        - ls_output.stdout_lines is defined
-        - ls_output.stdout_lines | length > 0
-
-  handlers:
-    - name: reload_httpd
-      systemd:
-        name: httpd
-        state: reloaded
-        enabled: yes
-        daemon_reload: true
-
-    - name: get_cwagent_status
-      command: >
-        {{ aws_cwagent_install_path }}/bin/{{ aws_cwagent_package }}-ctl
-        -m ec2
-        -a status
-      register: cwagent_status
-      failed_when: >
-        cwagent_status.rc > 0 or
-        'running' not in cwagent_status.stdout
-      notify: print_cwagent_status
-
-    - name: print_cwagent_status
-      debug:
-        msg: "{{ cwagent_status.stdout }}"
-      when:
-        - cwagent_status.stdout is defined
-        - cwagent_statu
+  def import_stack_export(self, export_name, resource_type=None):
+    return import_stack_export(export_name, resource_type)
    
