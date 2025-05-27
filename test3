@@ -1,1 +1,7 @@
-
+- export AWS_CDK_LIB_VERSION="2.179.0"
+      - export AWS_CDK_CLI_VERSION="^2"
+      - export PYENV_ROOT="$HOME/.pyenv"
+      - export PATH="$PYENV_ROOT/bin:$PATH"
+      - export PIPENV_PYTHON="$PYENV_ROOT/shims/python"
+      - npm install --location=global aws-cdk@$AWS_CDK_CLI_VERSION
+      - npm install --location=global aws-cdk-lib@$AWS_CDK_LIB_VERSION
