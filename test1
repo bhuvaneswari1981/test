@@ -1,10 +1,64 @@
-{
-  "app": "python3 app.py",
-  "context": {
-    "@aws-cdk/aws-apigateway:usagePlanKeyOrderInsensitiveId": false,
-    "@aws-cdk/aws-cloudfront:defaultSecurityPolicyTLSv1.2_2021": false,
-    "@aws-cdk/aws-rds:lowercaseDbIdentifier": false,
-    "@aws-cdk/core:stackRelativeExports": false
-  }
-}
-   
+CDK CLI and Construct Library Version Split Update
+📋 Overview
+This PR updates our CDK installation and dependency management to align with AWS CDK's new versioning strategy, where the CLI and Construct Library are no longer released in lockstep starting February 2025.
+🔄 What Changed in AWS CDK
+
+Before: CDK CLI and Construct Library had the same version (e.g., both 2.174.0)
+After: They have independent release cycles with different version numbers:
+
+CLI: 2.1000.0, 2.1001.0, 2.1002.0... (new numbering scheme)
+Library: 2.175.0, 2.176.0, 2.177.0... (continues current numbering)
+
+
+
+🎯 Compatibility Rule
+
+New Rule: CLI release date >= Library release date
+Recommendation: Keep CLI at latest version (^2) and pin Library to specific versions
+Backward Compatible: New CLI versions support all previous Library versions
+
+📁 Files Modified
+1. buildspec.yml (or build configuration)
+Changed installation approach:
+yaml# Before (Single version for both)
+- export CDK_VERSION="2.174.0"
+- npm install -g aws-cdk@$CDK_VERSION
+- pip install aws-cdk-lib==$CDK_VERSION
+
+# After (Separate versioning)
+- export AWS_CDK_CLI_VERSION="^2"           # Always latest CLI
+- export AWS_CDK_LIB_VERSION="2.179.0"     # Pin Library version
+- npm install -g aws-cdk@$AWS_CDK_CLI_VERSION
+- pip install aws-cdk-lib==$AWS_CDK_LIB_VERSION
+2. requirements.txt
+Updated CDK library dependency:
+txt# Uses environment variable for flexible version management
+aws-cdk-lib==${AWS_CDK_LIB_VERSION}
+constructs>=10.0.0,<11.0.0
+✅ What Didn't Change
+
+No Python code changes: All imports remain from aws_cdk import ...
+No cdk.json changes: Configuration stays identical
+No application logic changes: CDK app functionality unchanged
+Same deployment process: cdk deploy, cdk synth work exactly the same
+
+🔧 Technical Details
+
+CLI Package: aws-cdk (Node.js) - Tool for running CDK commands
+Library Package: aws-cdk-lib (Python) - Code we import in our applications
+Separation: CLI handles deployment, Library defines infrastructure
+Compatibility: Latest CLI (^2) works with all Library versions we use
+
+🎯 Benefits
+
+Future-proof: Aligned with AWS CDK's new release strategy
+Flexibility: Can update CLI and Library independently
+Stability: Pinned Library versions ensure consistent builds
+Compatibility: No breaking changes to existing functionality
+
+✨ Impact Assessment
+
+Zero code changes required in Python CDK applications
+Zero runtime impact - same CloudFormation templates generated
+Improved maintainability with cleaner version management
+Ready for future CDK updates without version conflicts
