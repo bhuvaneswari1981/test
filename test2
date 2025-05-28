@@ -1,23 +1,13 @@
-# pylint: disable=redefined-builtin
-from aws_cdk import App
-from base.ped_app import PEDApp
-from product.payeredi.stacks.batch.jobs.stack import PEDBatchJobs
-import common.utility.promote_util as promote
-
-class PEDBatchJobsApp(PEDApp):
-  def __init__(self):
-    super().__init__()
-
-    cdk_app = App()
-    self.ped_props.stack_arg = cdk_app.node.try_get_context("batch_stack_arg")
-    batch_stack = self.ped_config[self.ped_props.stack_arg]
-    #Promote image from source Repo to target Repo
-    promote.run_promotion(batch_stack['jobs'], self.ped_config, self.ped_props.app_env)
-    PEDBatchJobs(app=cdk_app,
-                 id=batch_stack['stack_name'],
-                 ped_config=self.ped_config,
-                 ped_props=self.ped_props)
-    cdk_app.synth()
-
-PEDBatchJobsApp()
-
+ansible==9.13.0
+aws-cdk-lib==${AWS_CDK_LIB_VERSION}
+constructs==10.4.2
+botocore==1.37.7
+boto3==1.37.7
+pytest==8.3.5
+pytz==2025.1
+GitPython==3.1.44
+expandvars==0.12.0
+pyodbc==5.2.0
+pymssql==2.3.2
+docker==7.1.0
+requests==2.32.3
