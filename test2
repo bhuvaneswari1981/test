@@ -1,13 +1,71 @@
-ansible==9.13.0
-aws-cdk-lib==${AWS_CDK_LIB_VERSION}
-constructs==10.4.2
-botocore==1.37.7
-boto3==1.37.7
-pytest==8.3.5
-pytz==2025.1
-GitPython==3.1.44
-expandvars==0.12.0
-pyodbc==5.2.0
-pymssql==2.3.2
-docker==7.1.0
-requests==2.32.3
+# Optim / RXClaims {{ trans.name }} files
+# NOTES on contents of CONFIG files:
+#   The following entries are REQUIRED in the config file:
+#     SFOLDER: A source folder
+#       May be relative to the user's home, or an absolute path (starts with /)
+#       example: SFOLDER=sftp/outgoing/837
+#     DFOLDER: A destination folder
+#       May be relative to the user's home, or an absolute path (starts with /)
+#       example: SFOLDER=sshfs/incoming/837
+#     TYPE: The type of transaction, valid values are
+#           copy - copies file from source to destination - run edigw-copy.sh
+#           azcopy - requires program azcopy - run edigw-azcopy.sh
+#           sftp - copies to SFTP mount, runs edigw-sshfs.sh
+#           curl - performs curl operation - run edigw-curl.sh
+#   The following entries are OPTIONAL in the config file:
+#     RUNAS: the account that this config file SHOULD be run under
+#       Not REQUIRED, but suggested - to ensure that the config file
+#       is designed for this user
+#     AFOLDER: An ARCHIVE folder
+#       May be relative to the default archive, or an absolute path (starts with /)
+#       example: AFOLDER=vacpe-837
+#       DEFAULT: NONE - if not set, no ARCHIVE is made
+#         NOTE: Default archive home is {{ s3_bucket_root | default('/mnt/s3/clientzone') }}/archive
+#     TFOLDER: A TEMP I/O folder
+#       May be relative to the user's home, or an absolute path (starts with /)
+#       example: TFOLDER={{ s3_bucket_root | default('/mnt/s3/clientzone') }}/vacpe
+#       DEFAULT: {{ s3_bucket_root | default('/mnt/s3/clientzone') }}/{user} (level above /inbound and /outbound
+#         that is top level visible to sftp clients - so out of view of clients)
+#     DFILENAME: A hardcoded file name for the destination
+#       May only be a filename, not a folder - appended to DFOLDER
+#       example: DFILENAME="'FMSTST.FMS.FMSTOCHV.LINK.VENDREQ(0)'"
+#       DEFAULT: NONE - if not set, filenames match what is found in SFOLDER
+#     DELSRC: Flag as to whether the Source should be deleted post-transfer
+#       Values are Y or N
+#       DEFAULT: Y (Source files are deleted upon successful transfer)
+#     DUPECHECK: Flag as to whether the file should be checked for duplicates in ARCHIVE
+#       Values are Y or N
+#       DEFAULT: Y (Duplicates are logged, but not transferred)
+#         NOTE: DUPECHECK only works if AFOLDER is also set
+#         ALSO: DUPECHECK ONLY checks files from the past 10 days
+#     GLOB: A file glob to "filter" filenames to be transferred
+#       Values are bash file-globs (as will be used in an ls command)
+#       DEFAULT: NONE - if not set, all files in the SFOLDER will be transferred
+#     REGEX: A regular expression to use to further match filename patterns
+#       DEFAULT: NONE
+#     SFTP_ONLY: Flag indicating only sftp commands can be used
+#       Values is 1 if set
+#       DEFAULT: no default, not used if not set
+#     SFTP_GET: Flag indicating only sftp commands can be used for processing direction in
+#       Values is 1 if set
+#       DEFAULT: no default, not used if not set
+#     SFTP_PUT: Flag indicating only sftp commands can be used for processing direction out
+#       Values is 1 if set
+#       DEFAULT: no default, not used if not set
+#
+
+RUNAS="{{ sftpuser }}"
+NAME="{{ trans.name }}"
+SFOLDER="{{ trans.src }}"
+DFOLDER="{{ trans.dest }}"
+AFOLDER="{{ sftpuser }}-{{ trans.processing_direction }}-{{ trans.name }}"
+GLOB="{{ trans.glob | default('') }}"
+REGEX="{{ trans.regex | default('') }}"
+DELSRC="{{ trans.del | default('Y') }}"
+TYPE={{ trans.type }}
+SFTP_ONLY=1
+{% if trans.processing_direction == 'out' -%}
+SFTP_PUT=1
+{% else -%}
+SFTP_GET=1
+{% endif %}
