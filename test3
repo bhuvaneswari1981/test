@@ -1,4 +1,1 @@
-2025-05-30 15:48:46,599 [INFO]: common_util.py::423: (print_resource_versions): Lambdas Updated Successfully: 1
-2025-05-30 15:48:46,599 [INFO]: common_util.py::425: (print_resource_versions): {'Item': 'project-ped-835-orchestrator-test', 'ECR': 'test-vfmp-835-lambda', 'found': 'a5af657_promoted_to_pte'}
-2025-05-30 15:48:46,599 [INFO]: common_util.py::427: (print_resource_versions): Batch Jobs Updated Successfully: 36
-2025-05-30 15:48:46,599 [INFO]: common_util.py::429: (print_resource_versions): {'Item': 'test-270-rehydrator', 'ECR': 'test-vfmp-270-rehydrator', 'found': '2-8fef376'}
+^.*?(\{'Item':.*\})
