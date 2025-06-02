@@ -1,5 +1,55 @@
-INSTALLED_CLI_VER=$(cdk --version | grep -oP '\d+\.\d+\.\d+')
+[Container] 2025/06/02 19:50:40.650068 Running command echo "Checking CDK version compatibility..."
+CLI_VER=$(cdk --version | grep -oP '\d+\.\d+\.\d+')
 
-# Use importlib.metadata for Python 3.8+ (or fallback to pkg_resources for older versions)
-INSTALLED_LIB_VER=$(python -c "from importlib.metadata import version; print(version('aws-cdk-lib'))")
-INSTALLED_CONSTRUCTS_VER=$(python -c "from importlib.metadata import version; print(version('constructs'))")
+# Use importlib.metadata for Python 3.8+
+LIB_VER=$(python -c "from importlib.metadata import version; print(version('aws-cdk-lib'))")
+CONSTRUCTS_VER=$(python -c "from importlib.metadata import version; print(version('constructs'))")
+
+echo "Installed: CLI=$CLI_VER, LIB=$LIB_VER, CONSTRUCTS=$CONSTRUCTS_VER"
+[ "$CLI_VER" = "$AWS_CDK_CLI_VERSION" ] || { echo "CDK CLI version mismatch"; exit 1; }
+[ "$LIB_VER" = "$AWS_CDK_LIB_VERSION" ] || { echo "CDK Lib version mismatch"; exit 1; }
+[ "$CONSTRUCTS_VER" = "$CONSTRUCTS_VERSION" ] || { echo "Constructs version mismatch"; exit 1; }
+
+# Validate CLI >= LIB
+compare_versions() {
+  v1=$(echo "$1" | awk -F. '{printf("%03d%03d%03d", $1,$2,$3)}')
+  v2=$(echo "$2" | awk -F. '{printf("%03d%03d%03d", $1,$2,$3)}')
+  [ "$v1" -ge "$v2" ]
+}
+compare_versions "$AWS_CDK_CLI_VERSION" "$AWS_CDK_LIB_VERSION" || {
+  echo "CDK CLI must be >= Library version"; exit 1;
+}
+
+[[ "$AWS_CDK_LIB_VERSION" =~ ^2\. ]] && [ "${CONSTRUCTS_VERSION%%.*}" != "10" ] && {
+  echo "CDK v2.x requires Constructs v10.x"; exit 1;
+}
+
+Checking CDK version compatibility...
+Installed: CLI=2.1017.1, LIB=2.190.0, CONSTRUCTS=10.4.2
+
+[Container] 2025/06/02 19:50:42.143780 Command did not exit successfully echo "Checking CDK version compatibility..."
+CLI_VER=$(cdk --version | grep -oP '\d+\.\d+\.\d+')
+
+# Use importlib.metadata for Python 3.8+
+LIB_VER=$(python -c "from importlib.metadata import version; print(version('aws-cdk-lib'))")
+CONSTRUCTS_VER=$(python -c "from importlib.metadata import version; print(version('constructs'))")
+
+echo "Installed: CLI=$CLI_VER, LIB=$LIB_VER, CONSTRUCTS=$CONSTRUCTS_VER"
+[ "$CLI_VER" = "$AWS_CDK_CLI_VERSION" ] || { echo "CDK CLI version mismatch"; exit 1; }
+[ "$LIB_VER" = "$AWS_CDK_LIB_VERSION" ] || { echo "CDK Lib version mismatch"; exit 1; }
+[ "$CONSTRUCTS_VER" = "$CONSTRUCTS_VERSION" ] || { echo "Constructs version mismatch"; exit 1; }
+
+# Validate CLI >= LIB
+compare_versions() {
+  v1=$(echo "$1" | awk -F. '{printf("%03d%03d%03d", $1,$2,$3)}')
+  v2=$(echo "$2" | awk -F. '{printf("%03d%03d%03d", $1,$2,$3)}')
+  [ "$v1" -ge "$v2" ]
+}
+compare_versions "$AWS_CDK_CLI_VERSION" "$AWS_CDK_LIB_VERSION" || {
+  echo "CDK CLI must be >= Library version"; exit 1;
+}
+
+[[ "$AWS_CDK_LIB_VERSION" =~ ^2\. ]] && [ "${CONSTRUCTS_VERSION%%.*}" != "10" ] && {
+  echo "CDK v2.x requires Constructs v10.x"; exit 1;
+}
+ exit status 1
