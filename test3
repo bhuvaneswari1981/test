@@ -48,37 +48,83 @@ phases:
       - cdk --version
       - |
         #!/bin/bash
-        # Validate CDK CLI, Library, and Constructs compatibility
-        CDK_CLI_VER=$(cdk --version | grep -oP '\d+\.\d+\.\d+')
-        CDK_LIB_VER=$(python -c "import aws_cdk_lib; print(aws_cdk_lib.__version__)")
-        CONSTRUCTS_VER=$(python -c "import constructs; print(constructs.__version__)")
+        # Validate version compatibility using predefined environment variables
+        echo "Expected CDK CLI Version: $AWS_CDK_CLI_VERSION"
+        echo "Expected CDK Library Version: $AWS_CDK_LIB_VERSION"
+        echo "Expected Constructs Version: $CONSTRUCTS_VERSION"
         
-        echo "CDK CLI Version: $CDK_CLI_VER"
-        echo "CDK Library Version: $CDK_LIB_VER"
-        echo "Constructs Version: $CONSTRUCTS_VER"
+        # Verify installed versions match expected versions
+        INSTALLED_CLI_VER=$(cdk --version | grep -oP '\d+\.\d+\.\d+')
+        INSTALLED_LIB_VER=$(python -c "import aws_cdk_lib; print(aws_cdk_lib.__version__)")
+        INSTALLED_CONSTRUCTS_VER=$(python -c "import constructs; print(constructs.__version__)")
         
-        # Extract major.minor versions for compatibility check
-        CLI_MAJOR_MINOR=$(echo $CDK_CLI_VER | cut -d. -f1,2)
-        LIB_MAJOR_MINOR=$(echo $CDK_LIB_VER | cut -d. -f1,2)
-        CONSTRUCTS_MAJOR=$(echo $CONSTRUCTS_VER | cut -d. -f1)
+        echo "Installed CDK CLI Version: $INSTALLED_CLI_VER"
+        echo "Installed CDK Library Version: $INSTALLED_LIB_VER"
+        echo "Installed Constructs Version: $INSTALLED_CONSTRUCTS_VER"
+        
+        # Check if installed versions match expected versions
+        if [ "$INSTALLED_CLI_VER" != "$AWS_CDK_CLI_VERSION" ]; then
+          echo "ERROR: Expected CDK CLI v$AWS_CDK_CLI_VERSION but found v$INSTALLED_CLI_VER"
+          exit 1
+        fi
+        
+        if [ "$INSTALLED_LIB_VER" != "$AWS_CDK_LIB_VERSION" ]; then
+          echo "ERROR: Expected CDK Library v$AWS_CDK_LIB_VERSION but found v$INSTALLED_LIB_VER"
+          exit 1
+        fi
+        
+        if [ "$INSTALLED_CONSTRUCTS_VER" != "$CONSTRUCTS_VERSION" ]; then
+          echo "ERROR: Expected Constructs v$CONSTRUCTS_VERSION but found v$INSTALLED_CONSTRUCTS_VER"
+          exit 1
+        fi
+        
+        # Function to compare version numbers (returns 0 if v1 >= v2, 1 if v1 < v2)
+        version_compare() {
+          local v1=$1
+          local v2=$2
+          # Convert versions to comparable format (remove dots, pad with zeros)
+          local v1_num=$(echo $v1 | awk -F. '{printf("%03d%03d%03d", $1, $2, $3)}')
+          local v2_num=$(echo $v2 | awk -F. '{printf("%03d%03d%03d", $1, $2, $3)}')
+          
+          if [ "$v1_num" -ge "$v2_num" ]; then
+            return 0  # v1 >= v2
+          else
+            return 1  # v1 < v2
+          fi
+        }
+        
+        # Now validate compatibility between the expected versions
+        CLI_MAJOR_MINOR=$(echo $AWS_CDK_CLI_VERSION | cut -d. -f1,2)
+        LIB_MAJOR_MINOR=$(echo $AWS_CDK_LIB_VERSION | cut -d. -f1,2)
+        CONSTRUCTS_MAJOR=$(echo $CONSTRUCTS_VERSION | cut -d. -f1)
         
         # Check CDK CLI vs Library compatibility
         if [ "$CLI_MAJOR_MINOR" != "$LIB_MAJOR_MINOR" ]; then
-          echo "ERROR: CDK CLI ($CDK_CLI_VER) and Library ($CDK_LIB_VER) major.minor versions don't match!"
+          echo "ERROR: CDK CLI v$AWS_CDK_CLI_VERSION and Library v$AWS_CDK_LIB_VERSION major.minor versions don't match!"
+          echo "CDK CLI major.minor: $CLI_MAJOR_MINOR, Library major.minor: $LIB_MAJOR_MINOR"
+          exit 1
+        fi
+        
+        # Check CLI release date >= Library release date (CLI should be same or newer)
+        if ! version_compare "$AWS_CDK_CLI_VERSION" "$AWS_CDK_LIB_VERSION"; then
+          echo "ERROR: CDK CLI version ($AWS_CDK_CLI_VERSION) is older than Library version ($AWS_CDK_LIB_VERSION)"
+          echo "CLI should be same version or newer than the Library to ensure compatibility"
+          echo "Recommendation: Update CLI to match or exceed Library version"
           exit 1
         fi
         
         # Check CDK Library vs Constructs compatibility
         # CDK v2.x requires constructs v10.x
-        if [ "$LIB_MAJOR_MINOR" = "2.0" ] || [[ "$CDK_LIB_VER" =~ ^2\. ]]; then
+        if [[ "$AWS_CDK_LIB_VERSION" =~ ^2\. ]]; then
           if [ "$CONSTRUCTS_MAJOR" != "10" ]; then
-            echo "ERROR: CDK Library v2.x ($CDK_LIB_VER) requires constructs v10.x, but found v$CONSTRUCTS_VER"
-            echo "CDK v2.x is compatible with constructs v10.x only"
+            echo "ERROR: CDK Library v2.x ($AWS_CDK_LIB_VERSION) requires constructs v10.x, but configured for v$CONSTRUCTS_VERSION"
+            echo "Please update CONSTRUCTS_VERSION to 10.x.x"
             exit 1
           fi
         fi
         
-        echo "✓ CDK CLI, Library, and Constructs versions are all compatible"
+        echo "✓ All versions match expected values and are compatible"
+        echo "✓ CLI version ($AWS_CDK_CLI_VERSION) >= Library version ($AWS_CDK_LIB_VERSION)"
       
       - |
         #!/bin/bash
