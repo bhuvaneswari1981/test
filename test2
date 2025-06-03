@@ -1,30 +1,448 @@
-#!/bin/bash
-set -e
+---
+# create/check release folder
+# copy public to remote folder
+- name: deployARSParser | Deploy ARS Parser
+  hosts: "{{ var_hosts }}"
+  gather_facts: true
+  remote_user: "{{ ansible_ssh_user }}"
+  become: true
 
-echo "Checking CDK version compatibility..."
+  roles:
+    - ansible-role-awscli
 
-CLI_VER=$(cdk --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+')
-LIB_VER=$(python -c "from importlib.metadata import version; print(version('aws-cdk-lib'))")
-CONSTRUCTS_VER=$(python -c "from importlib.metadata import version; print(version('constructs'))")
+  vars:
+    app_name: ars-parser
+    date_string: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+    deployment_filename: "{{ lookup('ansible.builtin.env', 'deployment_filename') }}"
+    github_project_repo: ars-275-parser
+    local_stage_path: "{{ ars_default_user_home }}/releases/{{ app_name }}"
+    release_path: "{{ ars_parser_run_dir }}"
+    log_dir_path: "/var/log/{{ app_name }}"
+    backup_path: "{{ ars_default_user_home }}/releases/backups"
+    sftp_group: "{{ s3_mount_group | default('s3write') }}"
+    no_log_value: true
+    backup_to_keep: 3
 
-echo "Installed: CLI=$CLI_VER, LIB=$LIB_VER, CONSTRUCTS=$CONSTRUCTS_VER"
+  pre_tasks:
+    - name: deployARSParser | Include all files in vars
+      include_vars:
+        dir: ../vars/ars-defaults
+        extensions:
+          - yml
 
-[ "$CLI_VER" = "$AWS_CDK_CLI_VERSION" ] || { echo "CDK CLI version mismatch"; exit 1; }
-[ "$LIB_VER" = "$AWS_CDK_LIB_VERSION" ] || { echo "CDK Lib version mismatch"; exit 1; }
-[ "$CONSTRUCTS_VER" = "$CONSTRUCTS_VERSION" ] || { echo "Constructs version mismatch"; exit 1; }
+    - name: deployARSParser | Include playbook pre tasks
+      include_tasks: ../tasks/playbookPreTasks.yml
 
-compare_versions() {
-  v1=$(echo "$1" | awk -F. '{printf("%03d%03d%03d", $1,$2,$3)}')
-  v2=$(echo "$2" | awk -F. '{printf("%03d%03d%03d", $1,$2,$3)}')
-  [ "$v1" -ge "$v2" ]
-}
+    - name: deployARSParser | Get the s3fuse library
+      include_tasks: ../tasks/gets3Fuse.yml
 
-compare_versions "$AWS_CDK_CLI_VERSION" "$AWS_CDK_LIB_VERSION" || {
-  echo "CDK CLI must be >= Library version"; exit 1;
-}
+  tasks:
+     # check stat of path
+    - name: deployARSParser | Is parser logs dir a symlink?
+      stat:
+        path: "{{ local_logs }}"
+      register: logs_link
 
-[[ "$AWS_CDK_LIB_VERSION" =~ ^2\. ]] && [ "${CONSTRUCTS_VERSION%%.*}" != "10" ] && {
-  echo "CDK v2.x requires Constructs v10.x"; exit 1;
-}
+    - name: deployARSParser | Remove Symlinks for parser logs
+      file:
+        path: "{{ local_logs }}"
+        state: absent
+      when: logs_link.stat.islnk is defined and logs_link.stat.islnk
 
-echo "CDK version check passed."
+    - name: deployARSParser | Stop and disable Apache HTTPD
+      systemd:
+        name: httpd
+        state: stopped
+        enabled: no
+        daemon_reload: yes
+      register: httpd_stop_result
+      failed_when:
+        - httpd_stop_result is failed
+        - "'Could not find the requested service' not in httpd_stop_result.msg"
+
+    - name: deployARSParser | Create ARS USER group(s)
+      group:
+        state: present
+        name: "{{ ars_default_user_group }}"
+
+    - name: deployARSParser | Create ARS USER
+      user:
+        state: present
+        name: "{{ ars_default_user_name }}"
+        home: "{{ ars_default_user_home }}"
+        group: "{{ ars_default_user_group }}"
+        create_home: true
+        comment: "ARS user"
+
+    - name: deployARSParser | Change ownership of ARS USER HOME to allow group write
+      file:
+        state: directory
+        path: "{{ ars_default_user_home }}"
+        mode: 0770
+
+    - name: deployARSParser | Create backup filename
+      set_fact:
+        parserBackup: "{{ backup_path }}/parserBackup_{{ date_string }}.tgz"
+      tags: always
+
+    - name: deployARSParser | Ensure directories exist for application operation
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      with_items:
+        - { path: "{{ release_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+        - { path: "{{ backup_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+        - { path: "{{ local_stage_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+        - { path: "{{ log_dir_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+      loop_control:
+        label: "Create {{ item.path }}"
+
+    - name: deployARSParser | Ensure deployment log directories exists
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0755
+      with_items:
+        - /var/log/deployments
+
+    - name: deployARSParser |  Get artifact branch
+      set_fact:
+        artifact_branch: "{{ 'develop' if app_env in ['dev','test'] else 'master' }}"
+
+    - name: deployARSParser | Get archive from buildartifacts
+      include_tasks: ../tasks/sparse_checkout.yml
+      vars:
+        github_repo_name: "ars-build-artifacts"
+        sparse_checkout: "{{ deployment_filename }}"
+        base_dir: "/opt/tmp"
+        branch: "{{ artifact_branch }}"
+
+    - name: deployARSParser | Determine if there is an existing release
+      stat:
+        path: "{{ release_path }}"
+      register: previous_release_found
+
+    - name: deployARSParser | Archive the existing parser release
+      archive:
+        path: "{{ release_path }}"
+        dest: "{{ parserBackup }}"
+        format: gz
+        mode: 0755
+      when:
+        - previous_release_found.stat.exists is defined
+        - previous_release_found.stat.exists
+
+    #####################################################################
+    ### the following tasks setup the application configuration       ###
+    #####################################################################
+
+    - name: deployARSParser | Copy {{ archive_name.dest }} to {{ ars_parser_run_dir }} if jar
+      copy:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ ars_parser_run_dir }}"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: deployARSParser | Remove obsolete files and directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ archive_name.dest }}"
+        - "{{ ars_default_user_home }}/{{ app_name }}"
+        - "{{ ars_parser_run_dir }}/{{ app_name }}"
+        - "{{ ansible_env.HOME }}/releases/{{ app_name }}"
+
+    - name: deployARSParser | Verify s3write group exists
+      group:
+        name: "{{ s3_mount_group }}"
+        gid: 700
+
+    - name: deployARSParser | Create Mounts for external files using s3fs
+      include_tasks: ../tasks/configureS3Mounts.yml
+      vars:
+        s3_bucket_name: "{{ s3_bucket.name | lower }}"
+        s3_bucket_mount_name: "{{ s3_bucket.mount_name | lower }}"
+      when: s3_bucket.mount_name is defined
+      with_items: "{{ s3_buckets | default([]) }}"
+      loop_control:
+        loop_var: s3_bucket
+
+    - name: deployARSParser | Cleanup obsolete fstab entries for S3 mount
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: '^[#]*\/mnt\/s3.*'
+
+    - name: deployARSParser | Remove obsolete mounts
+      shell: "umount {{ ars_default_user_home }}/{{ item.path }}" # noqa command-instead-of-shell
+      register: unmount_bindings
+      changed_when: false
+      failed_when:
+        - unmount_bindings.stderr is defined
+        - unmount_bindings.stderr | length > 0
+        - not ("'not mounted' in unmount_bindings.stderr" and "'not found' in unmount_bindings.stderr")
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "unmount {{ ars_default_user_home }}/{{ item.path }}"
+
+    - name: deployARSParser | Cleanup directories before linking
+      file:
+        path: "{{ ars_default_user_home }}/{{ item.path }}"
+        state: absent
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "Cleanup {{ ars_default_user_home }}/{{ item.path }}"
+
+    - name: deployARSParser | Trigger handlers
+      meta: flush_handlers
+      tags:
+        - always
+
+    - name: deployARSParser | Create Symlinks to S3
+      file:
+        path: "{{ ars_default_user_home }}/{{ item.path }}"
+        src: "{{ s3_mount_root }}/{{ ars_default_user_name | lower }}/{{ item.source }}"
+        owner: "{{ ars_default_user_name }}"
+        group: "{{ ars_default_user_group }}"
+        state: link
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "Create Symlink to {{ s3_mount_root }}/{{ ars_default_user_name | lower }}/{{ item.source }}"
+
+    - name: deployARSParser | Verify symlinks exist
+      stat:
+        path: "{{ ars_default_user_home }}/{{ item.path }}"
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "Verify {{ ars_default_user_home }}/{{ item.path }}"
+      register: links
+      failed_when: links.stat.islnk is not defined
+
+    - name: deployARSParser | Add existing user to group {{ s3_mount_group }}
+      user:
+        name: "{{ item }}"
+        groups: "{{ s3_mount_group }}"
+        append: yes
+      loop:
+        - "{{ ars_default_user_name }}"
+
+    - name: deployARSParser | Create configuration and script files
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode | default('0644') }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        force: true
+        backup: true
+      register: set_context
+      with_items:
+        - src: "../templates/ars/run-ars-parser.sh.j2"
+          dest: "{{ ars_parser_run_dir }}/run-ars-ingest.sh"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0755'
+        - src: "../templates/ars/run-ars-parser.sh.j2"
+          dest: "{{ ars_parser_run_dir }}/run-ars-unmatch.sh"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0755'
+        - src: "../templates/ars/run-ars-parser.sh.j2"
+          dest: "{{ ars_parser_run_dir }}/run-ars-pedmatch.sh"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0755'
+        - src: "../templates/ars/{{ app_name }}.application.properties.j2"
+          dest: "{{ ars_parser_run_dir }}/parser.properties"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0644'
+        - src: "../templates/ars/{{ app_name }}.log4j2.xml.j2"
+          dest: "{{ ars_parser_run_dir }}/log4j2.xml"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0644'
+        - src: "../templates/ars/checkmounts.sh.j2"
+          dest: "/usr/local/bin/checkmounts.sh"
+          owner: "root"
+          group: "{{ s3_mount_group }}"
+          mode: '2755'
+        - src: "../templates/ars/{{ app_name }}-cwagent-logs.json.j2"
+          dest: "{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json"
+          owner: "root"
+          group: "root"
+          mode: '0755'
+      loop_control:
+        label: "deploy {{ item.src }}"
+      tags:
+        - skip_ansible_lint
+
+    - name: deployARSParser | Find backups of parser scripts and clean them up
+      shell: |
+        set -o pipefail;
+        ls -t {{ ars_parser_run_dir }} | grep run-ars.*sh.[0-9]* | tail -n +{{ backup_to_keep + 1 }}
+      failed_when: false
+      register: old_parser_scripts
+
+    - name: deployARSParser | Remove old parser scripts
+      file:
+        path: "{{ ars_parser_run_dir }}/{{ item }}"
+        state: absent
+      with_items: "{{ old_parser_scripts.stdout_lines }}"
+      when: old_parser_scripts.stdout_lines is defined
+
+    ###############################################
+    ### append configure cloudwatch agent to ship logs ###
+    ###############################################
+    - name: deployARSParser | Append the new config to start command
+      ansible.builtin.command: >
+        {{ aws_cwagent_ctl }}
+        -a append-config -m {{ aws_cwagent_mode }}
+        -c file:'{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json'
+        -s
+      notify: get_cwagent_status
+    #############################################################################
+    ### the following tasks are just to support logging our actual deployment ###
+    #############################################################################
+
+    - name: deployARSParser | Ensure deployment logging for server exists
+      file:
+        path: "{{ item.src }}"
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+      with_items:
+        - { src: /var/log/deployments }
+
+    - name: deployARSParser | Find all the jar files for {{ app_name }}
+      find:
+        path: "{{ release_path }}"
+        patterns: "{{ item }}*.jar"
+        recurse: yes
+      loop: ["275generation"]
+      register: found_app_jars
+      tags:
+        - find_manifest
+
+    - name: deployARSParser | What jar files did we find (increase verbosity to 3 to see)
+      debug:
+        var: found_app_jars
+        verbosity: 3
+
+    - name: deployARSParser | Set fact for manifest collector
+      set_fact:
+        manifest_collector: []
+
+    - name: deployARSParser | Parse the deployed manifest files
+      include_tasks: ../tasks/parseJarManifests.yml
+      loop: "{{ found_app_jars.results | map(attribute='files') | list }}"
+      loop_control:
+        loop_var: jar_name
+
+    - name: deployARSParser | Get the username running the deploy
+      command: whoami
+      delegate_to: localhost
+      register: username_on_the_host
+      changed_when: False
+      become: no
+
+    - name: deployARSParser | Update server deployment history
+      lineinfile:
+        dest: "/var/log/deployments/{{ app_name }}_{{ env }}_deploymentHistory.log"
+        line: >
+          "{{ date_string }},
+          {{ username_on_the_host.stdout }},
+          {{ app_name }},
+          {{ inventory_hostname }},
+          {% set files = [] -%}
+          {%- for key in manifest_collector.keys() if key.split('/')[-1] not in files -%}{{ files.append(key.split('/')[-1]) }}{%- endfor -%}
+          {{ files | join(',' ) }},
+          {{ deployment_filename }}"
+        create: yes
+        insertafter: EOF
+        state: present
+        mode: 0644
+      tags: find_manifest
+
+    - name: deployARSParser | Setup Crontab
+      ansible.builtin.include_tasks: ../tasks/configureCrontab.yml
+      vars:
+        application: "{{ app_name }}"
+        crontab_entries: "{{ parser_crontab_entries }}"
+
+    - name: deployARSParser | Send Email to users
+      community.general.mail:
+        subject: "Deployment completed for ARS Parser {{ env | upper }}"
+        body: "{{ lookup('template', '../templates/ars/deployment_notification_body.j2') }}"
+        from: jenkins@{{ inventory_hostname }} (AWS Automation)
+        to: "{{ ars_be_notification_list }}"
+        cc:
+          - "{{ default_reply_email }}"
+        headers:
+          - Reply-To="{{ default_reply_email }}"
+          - X-Special="Notification for deployment"
+        subtype: html
+      vars:
+        paragraph1: "Deployment env: {{ friendly_env }}"
+        paragraph2: |
+          APP NAME: {{ app_name }}</br>
+          Deployed Date: {{ date_string }}</br>
+          Deployed To: {{ inventory_hostname }}</br>
+          Details:</br>
+          {% for key, value in manifest_collector.items() %}
+          {% if value is string %}
+          {{ key }}:</br>{{ value }}</br>
+          {% else %}
+          {{ key }}:</br>{{ value | list | join ('</br>') }}
+          {% endif %}
+          {% endfor %}
+      failed_when: false
+      tags: skip_ansible_lint
+
+    # it is safe to ignore these errors, it is just a cleanup task to remove old backups
+    - name: deployARSParser | List old backups and clean them up
+      ansible.builtin.shell: |
+        set -o pipefail;
+        ls -t {{ backup_path }} | grep parserBackup_ | tail -n +{{ backup_to_keep + 1 }}
+      register: ls_output
+      become: true
+      changed_when: false
+      ignore_errors: true
+
+    - name: deployARSParser | Remove the old backups
+      file:
+        path: "{{ backup_path }}/{{ item }}"
+        state: absent
+      with_items: "{{ ls_output.stdout_lines }}"
+      when: ls_output.stdout_lines is defined
+
+  handlers:
+    - name: reload_mount
+      ansible.builtin.shell: |
+        fusermount -uz {{ s3_mount_root }}/ars;
+        mount -a;
+      tags:
+        - skip_ansible_lint
+
+    - name: get_cwagent_status
+      ansible.builtin.command: >
+        {{ aws_cwagent_install_path }}/bin/{{ aws_cwagent_package }}-ctl
+        -m ec2
+        -a status
+      register: cwagent_status
+      failed_when: >
+        cwagent_status.rc > 0 or
+        'running' not in cwagent_status.stdout
+      notify: print_cwagent_status
+
+    - name: print_cwagent_status
+      ansible.builtin.debug:
+        msg: "{{ cwagent_status.stdout }}"
+      when:
+        - cwagent_status.stdout is defined
+        - cwagent_status.stdout | length > 0
