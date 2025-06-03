@@ -1,13 +1,25 @@
-- name: deployARSParser | Find old 275generation JARs
-  find:
-    paths: "{{ ars_parser_run_dir }}"
-    patterns: "275generation*.jar"
-  register: old_jars_to_remove
+---
+- name: parseJarManifest | Read jar manifest
+  shell: >
+    unzip -q -c {{ item.path }} META-INF/MANIFEST.MF
+    | grep -Ei 'Implementation-Version|Distribution-Filename|Build-Timestamp'
+  register: manifest_details
+  loop: "{{ jar_name }}"
+  loop_control:
+    label: "{{ item.path }}"
+  failed_when: "manifest_details.rc == 2"
+  tags:
+    - skip_ansible_lint
+    - find_manifest
 
-- name: deployARSParser | Remove old 275generation JARs
-  file:
-    path: "{{ item.path }}"
-    state: absent
-  loop: "{{ old_jars_to_remove.files }}"
-  when: old_jars_to_remove.matched > 0
-  tags: cleanup_old_jars
+- name: parseJarManifests | append to collector
+  set_fact:
+    manifest_collector: "{{ manifest_collector | default({}) | combine({item.item.path: item.stdout_lines}) }}"
+  loop: "{{ manifest_details.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: parseJarManifests | print the collector
+  debug:
+    var: manifest_collector
+    verbosity: 3
