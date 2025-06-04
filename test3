@@ -1,93 +1,155 @@
-#####################################################################
-    ### CLEAN RELEASE DIRECTORY AND DEPLOY FRESH FILES               ###
-    #####################################################################
-    
-    - name: deployARSParser | Clean release directory completely
-      file:
-        path: "{{ release_path }}"
-        state: absent
+# pylint: disable=unspecified-encoding,redefined-builtin,inconsistent-return-statements,no-else-return
+import os
+import sys
+import json
+from datetime import datetime
+import logging
+import inspect
+from pytz import timezone
+from aws_cdk import (
+  Tags
+  )
+import yaml
 
-    - name: deployARSParser | Recreate clean release directory
-      file:
-        path: "{{ release_path }}"
-        state: directory
-        owner: "{{ ars_default_user_name }}"
-        group: "{{ ars_default_user_group }}"
-        mode: '0755'
+from ansible.inventory.manager import InventoryManager
+from ansible.parsing.dataloader import DataLoader
+from ansible.vars.manager import VariableManager
+from ansible.module_utils._text import to_bytes
+from ansible.parsing.vault import VaultSecret
+from ansible.template import Templar
+from ansible.utils.vars import combine_vars
 
-    - name: deployARSParser | Debug - Show what we're about to deploy
-      debug:
-        msg: 
-          - "Deploying: {{ deployment_filename }}"
-          - "Source: {{ archive_name.dest }}"
-          - "Destination: {{ ars_parser_run_dir }}"
-
-    - name: deployARSParser | Copy and rename jar file to standard name
-      copy:
-        src: "{{ archive_name.dest }}"
-        dest: "{{ ars_parser_run_dir }}/275generation.jar"
-        remote_src: true
-        owner: "{{ ars_default_user_name }}"
-        group: "{{ ars_default_user_group }}"
-        mode: '0644'
-      delegate_to: "{{ inventory_hostname }}"
-
-    - name: deployARSParser | Verify new jar was deployed
-      stat:
-        path: "{{ release_path }}/275generation.jar"
-      register: deployed_jar
-
-    - name: deployARSParser | Fail if jar was not deployed
-      fail:
-        msg: "275generation.jar not found in {{ release_path }} after deployment"
-      when: not deployed_jar.stat.exists
-
-    - name: deployARSParser | Create configuration and script files (without backup)
-      template:
-        src: "{{ item.src }}"
-        dest: "{{ item.dest }}"
-        mode: "{{ item.mode | default('0644') }}"
-        owner: "{{ item.owner }}"
-        group: "{{ item.group }}"
-        force: true
-        backup: false
-      with_items:
-        - src: "../templates/ars/run-ars-parser.sh.j2"
-          dest: "{{ ars_parser_run_dir }}/run-ars-ingest.sh"
-          owner: "{{ ars_default_user_name }}"
-          group: "{{ ars_default_user_group }}"
-          mode: '0755'
-        - src: "../templates/ars/run-ars-parser.sh.j2"
-          dest: "{{ ars_parser_run_dir }}/run-ars-unmatch.sh"
-          owner: "{{ ars_default_user_name }}"
-          group: "{{ ars_default_user_group }}"
-          mode: '0755'
-        - src: "../templates/ars/run-ars-parser.sh.j2"
-          dest: "{{ ars_parser_run_dir }}/run-ars-pedmatch.sh"
-          owner: "{{ ars_default_user_name }}"
-          group: "{{ ars_default_user_group }}"
-          mode: '0755'
-        - src: "../templates/ars/{{ app_name }}.application.properties.j2"
-          dest: "{{ ars_parser_run_dir }}/parser.properties"
-          owner: "{{ ars_default_user_name }}"
-          group: "{{ ars_default_user_group }}"
-          mode: '0644'
-        - src: "../templates/ars/{{ app_name }}.log4j2.xml.j2"
-          dest: "{{ ars_parser_run_dir }}/log4j2.xml"
-          owner: "{{ ars_default_user_name }}"
-          group: "{{ ars_default_user_group }}"
-          mode: '0644'
-        - src: "../templates/ars/checkmounts.sh.j2"
-          dest: "/usr/local/bin/checkmounts.sh"
-          owner: "root"
-          group: "{{ s3_mount_group }}"
-          mode: '2755'
-        - src: "../templates/ars/{{ app_name }}-cwagent-logs.json.j2"
-          dest: "{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json"
-          owner: "root"
-          group: "root"
-          mode: '0755'
-      loop_control:
-        label: "deploy {{ item.src }}"
+sys.path.insert(0, os.path.join('..','..','common'))
+from lambdas.layers.custom_logger import logger
 
 
+
+class ConfigUtil:
+  env_map = {
+             "dev": "ARS_DEV",
+             "test": "ARS_TEST",
+             "prep": "ARS_PREP",
+             "prod": "ARS_PROD",
+             }
+
+  #Method for reading in ansible vars as config
+  @staticmethod
+  def read_ansible_config_playvars(root_path="../../../../vars"):
+    ps='/'
+    loaded_vars = {}
+    logger.debug("loading vars from %s", root_path)
+    if not os.path.exists(root_path):
+      logger.error("Path %s does not exist", root_path)
+      return
+    # get all files in dir
+    yaml_files = [f for f in os.listdir(root_path) if os.path.isfile(ps.join([root_path,f]))]
+    logger.debug("files found: %s", yaml_files)
+    for filename in yaml_files:
+      logger.debug("try to open %s", ps.join([root_path,filename]))
+      with open(ps.join([root_path,filename]), 'r') as vars_file:
+        _vars = yaml.full_load(vars_file)
+      loaded_vars.update(_vars)
+    return loaded_vars
+
+  #Method for reading in ansible environment vars as config
+  @staticmethod
+  def read_ansible_config(directory=None, app_env="dev"):
+    '''
+    directory refers to the base project directory, if not set, make relative to this file
+    '''
+    app_env_dir = ConfigUtil.env_map[app_env]
+    if directory is None:
+      logger.debug("directory not set, use current directory as reference")
+      directory=os.path.abspath(os.path.dirname(__file__))
+    _env_dir = os.path.join(directory,'environments')
+    _vars_dir = os.path.join(directory,'vars','ars-defaults')
+    loader = DataLoader()
+    loader.set_vault_secrets([('default', VaultSecret(_bytes=to_bytes(os.environ['VAULTPASS'])))])
+    inventory = InventoryManager(loader=loader, sources='/'.join([_env_dir,app_env_dir]))
+    vm = VariableManager(loader=loader, inventory=inventory)
+    logger.info("Loading ansible config from %s", _env_dir)
+    logger.debug("Loading ansible hosts %s", inventory.get_groups_dict())
+    logger.debug("Loading ansible all hosts from %s", inventory.groups['all'].get_hosts())
+
+    group_vars = vm.get_vars(host=inventory.groups['all'].get_hosts()[0])
+    logger.info("length of group_vars: %s",  len(group_vars))
+    vars_root_path = os.path.abspath(_vars_dir)
+    logger.debug("base directory: %s", directory)
+    logger.debug("env directory: %s", _env_dir)
+    logger.debug("vars_root_path directory: %s", vars_root_path)
+
+    play_vars = ConfigUtil.read_ansible_config_playvars(root_path=vars_root_path)
+    logger.debug("play_vars: %s", play_vars)
+    if play_vars is not None:
+      logger.info("length of play_vars: %s",len(play_vars))
+      logger.debug("play_vars: %s", play_vars)
+      all_vars  = combine_vars(play_vars,group_vars)
+      logger.info("length of all_vars: %s", len(all_vars))
+    else:
+      all_vars = group_vars
+    templar = Templar(loader=loader, variables=all_vars)
+    result = templar.template(all_vars, fail_on_undefined=False)
+    return result
+
+  #Generic method or reading in config
+  @staticmethod
+  def read_config(type="stack", app_env="dev", directory=None):
+    '''
+    directory refers to the base project directory, if not set, find base relative to this file
+    '''
+    logger.debug("args %s",	inspect.currentframe().f_locals)
+    if directory is None:
+      directory=os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+    if type == "ansible":
+      return ConfigUtil.read_ansible_config(directory=directory, app_env=app_env)
+    elif type == "stack":
+      return ConfigUtil.read_stack_config()
+
+  #Method for reading in stacksettings.json config
+  @staticmethod
+  def read_stack_config():
+    with open("./stacksettings.json") as f:
+      settings = json.loads(f.read())
+    return settings
+
+  #Adds the commit id version and scm repo to resource tags
+  @staticmethod
+  def apply_version_tags(resource, environment, config_scm_repo_id="",image_tag=""):
+    source_version = os.environ['SOURCE_VERSION']
+    source_scm_name = os.environ["CODEBUILD_SRC_DIR"]
+    source_scm_name = source_scm_name.split("/")[-1]
+    logger.debug("determine CONFIG VERSION")
+    try:
+      config_version = os.environ['COMMIT_HASH_' + config_scm_repo_id]
+    except NameError:
+      config_version = os.environ['CONFIG_VERSION']
+    except Exception:
+      config_version = source_version
+    try:
+      config_scm_name = os.environ["CODEBUILD_SRC_DIR_" + config_scm_repo_id]
+    except NameError:
+      config_scm_name = os.environ["CONFIG_REPO"]
+    except Exception:
+      config_scm_name = source_scm_name
+
+    logger.debug("CONFIG VERSION %s, SCM NAME %s", config_version, config_scm_name)
+
+    if len(image_tag) > 0:
+      image_version = image_tag.split("/")[-1]
+      image_name = image_tag.split("/")[0]
+      logger.debug("Set IMAGE tags to %s: %s, source version %s", image_name, image_version, source_version )
+      Tags.of(resource).add("IMAGE_VERSION", image_version)
+      Tags.of(resource).add("IMAGE_NAME", image_name)
+      Tags.of(resource).add("SOURCE_VERSION", image_version)
+    else:
+      logger.debug("Set source version %s", source_version )
+      Tags.of(resource).add("SOURCE_VERSION", source_version)
+
+    logger.debug("Set PROJECT and CONFIG TAGS")
+    Tags.of(resource).add("CONFIG_VERSION", config_version)
+    Tags.of(resource).add("CONFIG_SCM_REPO", config_scm_name)
+    Tags.of(resource).add("PROJECT_ARS_ENVIRONMENT", environment)
+    Tags.of(resource).add("PROJECT_ARS_DEPLOY_TIMESTAMP", str(datetime.now(timezone('EST'))))
+    Tags.of(resource).remove("AWS_ENVIRONMENT")
+    Tags.of(resource).remove("AWS_DEPLOY_TIMESTAMP")
+    Tags.of(resource).remove("SOURCE_SCM_REPO")
