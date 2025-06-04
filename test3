@@ -1,25 +1,101 @@
----
-- name: parseJarManifest | Read jar manifest
-  shell: >
-    unzip -q -c {{ item.path }} META-INF/MANIFEST.MF
-    | grep -Ei 'Implementation-Version|Distribution-Filename|Build-Timestamp'
-  register: manifest_details
-  loop: "{{ jar_name }}"
-  loop_control:
-    label: "{{ item.path }}"
-  failed_when: "manifest_details.rc == 2"
-  tags:
-    - skip_ansible_lint
-    - find_manifest
+# Fixed deployment section - add this after the backup task and before the copy task
 
-- name: parseJarManifests | append to collector
-  set_fact:
-    manifest_collector: "{{ manifest_collector | default({}) | combine({item.item.path: item.stdout_lines}) }}"
-  loop: "{{ manifest_details.results }}"
-  loop_control:
-    label: "{{ item.item.path }}"
+    - name: deployARSParser | Archive the existing parser release
+      archive:
+        path: "{{ release_path }}"
+        dest: "{{ parserBackup }}"
+        format: gz
+        mode: 0755
+      when:
+        - previous_release_found.stat.exists is defined
+        - previous_release_found.stat.exists
 
-- name: parseJarManifests | print the collector
-  debug:
-    var: manifest_collector
-    verbosity: 3
+    #####################################################################
+    ### CLEAN UP OLD JAR FILES BEFORE DEPLOYING NEW ONE              ###
+    #####################################################################
+    
+    - name: deployARSParser | Find existing jar files in release path
+      find:
+        path: "{{ release_path }}"
+        patterns: 
+          - "*.jar"
+        file_type: file
+      register: existing_jars
+      
+    - name: deployARSParser | Remove existing jar files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_jars.files }}"
+      loop_control:
+        label: "Removing old jar: {{ item.path }}"
+      when: existing_jars.files | length > 0
+
+    - name: deployARSParser | Debug - Show what we're about to deploy
+      debug:
+        msg: 
+          - "Deploying: {{ deployment_filename }}"
+          - "Source: {{ archive_name.dest }}"
+          - "Destination: {{ ars_parser_run_dir }}"
+
+    #####################################################################
+    ### the following tasks setup the application configuration       ###
+    #####################################################################
+
+    - name: deployARSParser | Copy {{ archive_name.dest }} to {{ ars_parser_run_dir }} if jar
+      copy:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ ars_parser_run_dir }}"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: deployARSParser | Verify new jar was deployed
+      find:
+        path: "{{ release_path }}"
+        patterns: "*.jar"
+        file_type: file
+      register: deployed_jars
+
+    - name: deployARSParser | Show deployed jar files
+      debug:
+        msg: "Deployed jars: {{ deployed_jars.files | map(attribute='path') | list }}"
+
+    - name: deployARSParser | Fail if no jar was deployed
+      fail:
+        msg: "No jar file found in {{ release_path }} after deployment"
+      when: deployed_jars.files | length == 0
+
+    - name: deployARSParser | Warn if multiple jars exist
+      debug:
+        msg: "WARNING: Multiple jar files found - this may cause issues: {{ deployed_jars.files | map(attribute='path') | list }}"
+      when: deployed_jars.files | length > 1
+
+# Also fix the jar discovery section to be more specific
+
+    - name: deployARSParser | Find all the jar files for {{ app_name }} (FIXED)
+      find:
+        path: "{{ release_path }}"
+        patterns: 
+          - "*275generation*.jar"
+          - "ars-275generation*.jar"
+        file_type: file
+        recurse: yes
+      register: found_app_jars
+      tags:
+        - find_manifest
+
+    - name: deployARSParser | Debug found jar files
+      debug:
+        msg: 
+          - "Searching in: {{ release_path }}"
+          - "Found {{ found_app_jars.files | length }} jar files"
+          - "Files: {{ found_app_jars.files | map(attribute='path') | list }}"
+      tags:
+        - find_manifest
+
+    - name: deployARSParser | Ensure exactly one jar file exists
+      fail:
+        msg: "Expected exactly 1 jar file, but found {{ found_app_jars.files | length }}: {{ found_app_jars.files | map(attribute='path') | list }}"
+      when: found_app_jars.files | length != 1
+      tags:
+        - find_manifest
