@@ -1,0 +1,18 @@
+s3_mount_root: /mnt/s3
+s3_mount_group: s3write
+
+s3_bindings:
+  - { path: 'attachments', source: attachments }
+  - { path: '277ca_to_cstat', source: 277ca_to_cstat }
+
+s3_mount_options:
+  - "_netdev"
+  - "nosuid"
+
+s3_buckets:
+  - name: "project-{{ env }}-processing"
+    versioning: true
+    mount_name: "{{ ars_default_user_name }}"
+    folders:
+      - "attachments/incoming"
+      - "attachments/output"
