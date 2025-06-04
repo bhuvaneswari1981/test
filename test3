@@ -1,12 +1,233 @@
-for filename in yaml_files:
-  full_path = ps.join([root_path, filename])
-  logger.debug("try to open %s", full_path)
-  with open(full_path, 'r') as vars_file:
-    _vars = yaml.full_load(vars_file)
+# Configure s3 buckets and lifecycle rules
+import sys
+import os
+import logging
+import boto3
 
-  if isinstance(_vars, dict):
-    loaded_vars.update(_vars)
+from botocore.exceptions import ClientError
+sys.path.insert(0, os.path.join('..','..','common'))
+from utility.config_util import ConfigUtil
+from utility.common_util import CommonUtil
+
+app_env = os.environ['APP_ENV']
+#Read configurations
+config = ConfigUtil.read_config(directory=os.environ.get('CODEBUILD_SRC_DIR'), type="ansible", app_env=app_env)
+
+logger = logging.getLogger()
+lvl = logging.getLevelName(os.environ.get('CB_LOG_LEVEL', 'INFO'))
+logging.basicConfig(format='%(asctime)s [%(levelname)s]: %(funcName)s - %(message)s')
+logger.setLevel(lvl)
+
+region = config['aws_region']
+aws_account = str(config['aws_account_id'])
+aws_partition = config['aws_partition']
+
+#Extract the list of Buckets to operate on
+bucket_list = config['s3_buckets']
+
+#Get a handle to the S3 client
+s3 = boto3.client("s3")
+s3_resource  = boto3.resource('s3')
+
+#Loop through the bucket configurations
+for bucket in bucket_list:
+  http_rsp_code = None
+  bucket_name = bucket['name']
+  logger.info("Creating/updating buckets and folders for %s", bucket['name'])
+
+  logger.debug("Processing bucket name %s", bucket_name)
+  versioning_flag = False
+  if 'versioning' in bucket:
+    versioning_flag = bucket['versioning']
+
+  if not CommonUtil.validate_s3_access(bucket=bucket_name):
+    # Create the bucket if it doesn't exist
+    logger.info("Creating S3 Bucket %s", bucket_name)
+    try:
+      response = s3.create_bucket(Bucket=bucket_name,
+      CreateBucketConfiguration={ 'LocationConstraint': region })
+      # Extract the response code and print it out
+      http_rsp_code = response['ResponseMetadata']['HTTPStatusCode']
+      logger.debug("HTTP Response for bucket creation of %s: %s", bucket_name ,http_rsp_code)
+    except ClientError as ce:
+      logger.warning(ce.response['Error']['Code'])
+
+  #Default to versioning suspended
+  version_config = {'Status': 'Suspended'}
+
+  #If versioning flag is true, enable it on the bucket.
+  if versioning_flag:
+    version_config['Status'] = 'Enabled'
+
+  #Attach versioning configuration to bucket
+  s3.put_bucket_versioning(Bucket=bucket_name, VersioningConfiguration=version_config)
+  #Grab the folders list, if there are any
+  if 'folders' in bucket:
+    folders = bucket['folders']
+    #Loop through the folders we want to create
+    for folder in folders:
+      path = folder['path']
+      if not CommonUtil.validate_s3_access(bucket=bucket_name, prefix=f"{path}/"):
+        logger.info("folder not found, create %s", path)
+        try:
+          response = s3.put_object(Bucket=bucket_name, Key=f"{path}/")
+          # Extract the response code and print it out
+          http_rsp_code = response['ResponseMetadata']['HTTPStatusCode']
+          logger.debug("HTTP Response for folder creation of %s :%s",path,http_rsp_code)
+        except ClientError as ce:
+          logger.warning(ce.response['Error']['Code'])
+
+  if 'archive_enabled' in bucket:
+    response = s3.put_bucket_tagging(
+    Bucket=bucket_name,
+    Tagging={
+        'TagSet': [
+            {'Key': 'archive_enabled','Value': 'true'},
+        ]
+     }
+  )
+
+  if 'lifecycle_configuration' in bucket:
+    life_config = bucket['lifecycle_configuration']
+    lc_rules = []
+    for rule in life_config:
+      lc_rules.append({
+                 "ID": rule["rule_name"],
+                 "Status" : 'Enabled',
+                 "Filter": {"Tag": {'Key': 'archive_enabled', "Value": 'true'}} ,
+                 "Transitions": [{"Days": rule["days"],"StorageClass":
+                  rule["storage_class"]}],
+                 "NoncurrentVersionTransitions": [{"NoncurrentDays": rule["days"],
+                 "StorageClass": rule["storage_class"]}]
+               })
+    try:
+      logger.debug("Lifecycle rules: %s", lc_rules)
+      response=s3.put_bucket_lifecycle_configuration(
+                  Bucket=bucket_name,
+                  LifecycleConfiguration={'Rules': lc_rules}
+                  )
+    except ClientError as ce:
+      logger.warning(ce.response)
+
+  if 'inventory_destination_bucket' in bucket:
+    inventory_dest_bucket = bucket['inventory_destination_bucket']
+    if inventory_dest_bucket:
+      inventory_config = {
+        'Destination': {
+          'S3BucketDestination': {
+            'AccountId': str(aws_account),
+            'Bucket': f"arn:{aws_partition}:s3:::{inventory_dest_bucket}",
+            'Format': 'CSV',
+            'Prefix': 'inventory-data'
+          }
+        },
+        'IsEnabled': True,
+        'Id': f"{bucket_name}-daily-inventory-files",
+        'IncludedObjectVersions': 'All',
+        'OptionalFields': [ 'Size', 'LastModifiedDate' ],
+        'Schedule': {'Frequency': 'Daily'}
+      }
+      try:
+        inv_response=s3.put_bucket_inventory_configuration(
+                  Bucket = bucket_name,
+                  Id = f"{bucket_name}-daily-inventory-files",
+                  InventoryConfiguration = inventory_config
+                  )
+      except ClientError as ce:
+        logger.warning(ce.response)
+
+# set policy to allow other roles
+
+  account_access_roles = bucket['account_access_role'] if 'account_access_role' in bucket else None
+
+  if account_access_roles is not None:
+    statements=[]
+    for role in account_access_roles:
+      logger.info("Setting bucket policy for %s", bucket_name)
+      principal_dict = {"AWS": role['principal_arn']}
+      sid=''.join(filter(str.isalpha,(role['principal_arn'].rsplit('/',1))))
+      action = role['actions']
+      CommonUtil.set_bucket_policy(bucket=bucket_name,
+                                  principal=principal_dict,
+                                  policy_name=sid,
+                                  action=action
+                                  )
+
+  dest_bucket_name =  f"{app_env}-inventory-reports"
+  if bucket_name == dest_bucket_name:
+    logger.info("Setting inventory policy for %s", bucket_name)
+    principal_dict={"Service": "s3.amazonaws.com"}
+    CommonUtil.set_bucket_policy(bucket=bucket_name,
+                                  principal=principal_dict,
+                                  policy_name='AllowInventoryPolicy',
+                                  action=["s3:PutObject"]
+                                )
+
+# determine if there are obsolete s3 folders and buckets
+# if found, check if empty
+# if empty, delete
+if 'obsolete_s3_folders' in config:
+  logger.info("Removing obsolete buckets and folders!")
+  obsolete_folders_list = config['obsolete_s3_folders']
+  deleted_s3_items=[] # collect the list of items deleted
+  undeleted_s3_items=[] # collect the list of items unable to be deleted
+  for obsolete_folder in obsolete_folders_list:
+    try:
+      folder=obsolete_folder['name']
+      prefix=None
+      if '/' in folder:
+        bucket_name,prefix=folder.split('/',1)
+        logger.debug("folder %s, bucket %s, prefix %s", folder, bucket_name, prefix)
+      else:
+        bucket_name = folder
+      bucket = boto3.resource('s3').Bucket(bucket_name)
+      if prefix is not None:
+        prefix = f"{prefix}/"
+      if CommonUtil.validate_s3_access(bucket=bucket_name,prefix=prefix):
+        count=CommonUtil.list_with_versioning(bucket, prefix=prefix)
+        logger.debug("count %s", len(list(count)))
+        # if folder is empty, it will be a list of itself only
+        if len(list(count)) <= 1:
+          logger.info("prepare to delete %s", folder)
+          CommonUtil.permanently_delete_object(bucket=bucket, object_key=prefix)
+          if not CommonUtil.validate_s3_access(bucket=bucket_name,prefix=prefix):
+            deleted_s3_items.append(folder)
+        else:
+          logger.info("%s is not empty", folder)
+          undeleted_s3_items.append(folder)
+    except s3_resource.meta.client.exceptions.NoSuchBucket:
+      logger.info("%s does not exist, perhaps it is already deleted", obsolete_folder['name'])
+      deleted_s3_items.append(obsolete_folder['name'])
+    except ClientError as ce:
+      logger.error("exception: %s", ce)
+
+  for removed in deleted_s3_items:
+    logger.debug("deleted %s", removed)
+  for item in undeleted_s3_items:
+    logger.debug("Unable to delete %s", item)
+
+  message = "S3 Folder cleanup report"
+  if len(undeleted_s3_items) > 0:
+    logger.info("Send notice of folders not deleted")
+    message = "Unable to delete the following items.\n"
+    message += "Please verify the buckets/folders are empty.\n\t"
+    message += '\n\t'.join(undeleted_s3_items)
   else:
-    # Use filename (without extension) as key
-    key = os.path.splitext(filename)[0]
-    loaded_vars[key] = _vars
+    message += "\nThere were no undeleted folders."
+  if len(deleted_s3_items) > 0:
+    message += "\n\nThe following items were successfully deleted:\n\t"
+    message += '\n\t'.join(deleted_s3_items)
+  else:
+    message += "\nThere were no folders deleted for this run."
+
+  subject = app_env + "-s3-folder-cleanup"
+  topic_arn=f"{config['sns_arn']}:{config['s3_bucket_cleanup_sns_topic']}"
+
+  msg_id = CommonUtil.send_sns_message(
+                              topic=config['s3_bucket_cleanup_sns_topic'],
+                              topic_arn=topic_arn,
+                              message_string=message,
+                              subject=subject
+                              )
+
+  logger.info('Message published to topic %s, with message id %s',topic_arn,msg_id)
