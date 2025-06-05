@@ -1,233 +1,461 @@
-# Configure s3 buckets and lifecycle rules
-import sys
-import os
-import logging
-import boto3
+---
+# create/check release folder
+# copy public to remote folder
+- name: deployARSParser | Deploy ARS Parser
+  hosts: "{{ var_hosts }}"
+  gather_facts: true
+  remote_user: "{{ ansible_ssh_user }}"
+  become: true
 
-from botocore.exceptions import ClientError
-sys.path.insert(0, os.path.join('..','..','common'))
-from utility.config_util import ConfigUtil
-from utility.common_util import CommonUtil
+  roles:
+    - ansible-role-awscli
 
-app_env = os.environ['APP_ENV']
-#Read configurations
-config = ConfigUtil.read_config(directory=os.environ.get('CODEBUILD_SRC_DIR'), type="ansible", app_env=app_env)
+  vars:
+    app_name: ars-parser
+    date_string: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+    deployment_filename: "{{ lookup('ansible.builtin.env', 'deployment_filename') }}"
+    github_project_repo: ars-275-parser
+    local_stage_path: "{{ ars_default_user_home }}/releases/{{ app_name }}"
+    release_path: "{{ ars_parser_run_dir }}"
+    log_dir_path: "/var/log/{{ app_name }}"
+    backup_path: "{{ ars_default_user_home }}/releases/backups"
+    sftp_group: "{{ s3_mount_group | default('s3write') }}"
+    no_log_value: true
+    backup_to_keep: 3
 
-logger = logging.getLogger()
-lvl = logging.getLevelName(os.environ.get('CB_LOG_LEVEL', 'INFO'))
-logging.basicConfig(format='%(asctime)s [%(levelname)s]: %(funcName)s - %(message)s')
-logger.setLevel(lvl)
+  pre_tasks:
+    - name: deployARSParser | Include all files in vars
+      include_vars:
+        dir: ../vars/ars-defaults
+        extensions:
+          - yml
 
-region = config['aws_region']
-aws_account = str(config['aws_account_id'])
-aws_partition = config['aws_partition']
+    - name: deployARSParser | Include playbook pre tasks
+      include_tasks: ../tasks/playbookPreTasks.yml
 
-#Extract the list of Buckets to operate on
-bucket_list = config['s3_buckets']
+    - name: deployARSParser | Get the s3fuse library
+      include_tasks: ../tasks/gets3Fuse.yml
 
-#Get a handle to the S3 client
-s3 = boto3.client("s3")
-s3_resource  = boto3.resource('s3')
+  tasks:
+     # check stat of path
+    - name: deployARSParser | Is parser logs dir a symlink?
+      stat:
+        path: "{{ local_logs }}"
+      register: logs_link
 
-#Loop through the bucket configurations
-for bucket in bucket_list:
-  http_rsp_code = None
-  bucket_name = bucket['name']
-  logger.info("Creating/updating buckets and folders for %s", bucket['name'])
+    - name: deployARSParser | Remove Symlinks for parser logs
+      file:
+        path: "{{ local_logs }}"
+        state: absent
+      when: logs_link.stat.islnk is defined and logs_link.stat.islnk
 
-  logger.debug("Processing bucket name %s", bucket_name)
-  versioning_flag = False
-  if 'versioning' in bucket:
-    versioning_flag = bucket['versioning']
+    - name: deployARSParser | Stop and disable Apache HTTPD
+      systemd:
+        name: httpd
+        state: stopped
+        enabled: no
+        daemon_reload: yes
+      register: httpd_stop_result
+      failed_when:
+        - httpd_stop_result is failed
+        - "'Could not find the requested service' not in httpd_stop_result.msg"
 
-  if not CommonUtil.validate_s3_access(bucket=bucket_name):
-    # Create the bucket if it doesn't exist
-    logger.info("Creating S3 Bucket %s", bucket_name)
-    try:
-      response = s3.create_bucket(Bucket=bucket_name,
-      CreateBucketConfiguration={ 'LocationConstraint': region })
-      # Extract the response code and print it out
-      http_rsp_code = response['ResponseMetadata']['HTTPStatusCode']
-      logger.debug("HTTP Response for bucket creation of %s: %s", bucket_name ,http_rsp_code)
-    except ClientError as ce:
-      logger.warning(ce.response['Error']['Code'])
+    - name: deployARSParser | Create ARS USER group(s)
+      group:
+        state: present
+        name: "{{ ars_default_user_group }}"
 
-  #Default to versioning suspended
-  version_config = {'Status': 'Suspended'}
+    - name: deployARSParser | Create ARS USER
+      user:
+        state: present
+        name: "{{ ars_default_user_name }}"
+        home: "{{ ars_default_user_home }}"
+        group: "{{ ars_default_user_group }}"
+        create_home: true
+        comment: "ARS user"
 
-  #If versioning flag is true, enable it on the bucket.
-  if versioning_flag:
-    version_config['Status'] = 'Enabled'
+    - name: deployARSParser | Change ownership of ARS USER HOME to allow group write
+      file:
+        state: directory
+        path: "{{ ars_default_user_home }}"
+        mode: 0770
 
-  #Attach versioning configuration to bucket
-  s3.put_bucket_versioning(Bucket=bucket_name, VersioningConfiguration=version_config)
-  #Grab the folders list, if there are any
-  if 'folders' in bucket:
-    folders = bucket['folders']
-    #Loop through the folders we want to create
-    for folder in folders:
-      path = folder['path']
-      if not CommonUtil.validate_s3_access(bucket=bucket_name, prefix=f"{path}/"):
-        logger.info("folder not found, create %s", path)
-        try:
-          response = s3.put_object(Bucket=bucket_name, Key=f"{path}/")
-          # Extract the response code and print it out
-          http_rsp_code = response['ResponseMetadata']['HTTPStatusCode']
-          logger.debug("HTTP Response for folder creation of %s :%s",path,http_rsp_code)
-        except ClientError as ce:
-          logger.warning(ce.response['Error']['Code'])
+    - name: deployARSParser | Create backup filename
+      set_fact:
+        parserBackup: "{{ backup_path }}/parserBackup_{{ date_string }}.tgz"
+      tags: always
 
-  if 'archive_enabled' in bucket:
-    response = s3.put_bucket_tagging(
-    Bucket=bucket_name,
-    Tagging={
-        'TagSet': [
-            {'Key': 'archive_enabled','Value': 'true'},
-        ]
-     }
-  )
+    - name: deployARSParser | Ensure directories exist for application operation
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      with_items:
+        - { path: "{{ release_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+        - { path: "{{ backup_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+        - { path: "{{ local_stage_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+        - { path: "{{ log_dir_path }}", mode: '0755', owner: "{{ ars_default_user_name }}", group: "{{ ars_default_user_group }}" }
+      loop_control:
+        label: "Create {{ item.path }}"
 
-  if 'lifecycle_configuration' in bucket:
-    life_config = bucket['lifecycle_configuration']
-    lc_rules = []
-    for rule in life_config:
-      lc_rules.append({
-                 "ID": rule["rule_name"],
-                 "Status" : 'Enabled',
-                 "Filter": {"Tag": {'Key': 'archive_enabled', "Value": 'true'}} ,
-                 "Transitions": [{"Days": rule["days"],"StorageClass":
-                  rule["storage_class"]}],
-                 "NoncurrentVersionTransitions": [{"NoncurrentDays": rule["days"],
-                 "StorageClass": rule["storage_class"]}]
-               })
-    try:
-      logger.debug("Lifecycle rules: %s", lc_rules)
-      response=s3.put_bucket_lifecycle_configuration(
-                  Bucket=bucket_name,
-                  LifecycleConfiguration={'Rules': lc_rules}
-                  )
-    except ClientError as ce:
-      logger.warning(ce.response)
+    - name: deployARSParser | Ensure deployment log directories exists
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0755
+      with_items:
+        - /var/log/deployments
 
-  if 'inventory_destination_bucket' in bucket:
-    inventory_dest_bucket = bucket['inventory_destination_bucket']
-    if inventory_dest_bucket:
-      inventory_config = {
-        'Destination': {
-          'S3BucketDestination': {
-            'AccountId': str(aws_account),
-            'Bucket': f"arn:{aws_partition}:s3:::{inventory_dest_bucket}",
-            'Format': 'CSV',
-            'Prefix': 'inventory-data'
-          }
-        },
-        'IsEnabled': True,
-        'Id': f"{bucket_name}-daily-inventory-files",
-        'IncludedObjectVersions': 'All',
-        'OptionalFields': [ 'Size', 'LastModifiedDate' ],
-        'Schedule': {'Frequency': 'Daily'}
-      }
-      try:
-        inv_response=s3.put_bucket_inventory_configuration(
-                  Bucket = bucket_name,
-                  Id = f"{bucket_name}-daily-inventory-files",
-                  InventoryConfiguration = inventory_config
-                  )
-      except ClientError as ce:
-        logger.warning(ce.response)
+    - name: deployARSParser |  Get artifact branch
+      set_fact:
+        artifact_branch: "{{ 'develop' if app_env in ['dev','test'] else 'master' }}"
 
-# set policy to allow other roles
+    - name: deployARSParser | Get archive from buildartifacts
+      include_tasks: ../tasks/sparse_checkout.yml
+      vars:
+        github_repo_name: "ars-build-artifacts"
+        sparse_checkout: "{{ deployment_filename }}"
+        base_dir: "/opt/tmp"
+        branch: "{{ artifact_branch }}"
 
-  account_access_roles = bucket['account_access_role'] if 'account_access_role' in bucket else None
+    - name: deployARSParser | Determine if there is an existing release
+      stat:
+        path: "{{ release_path }}"
+      register: previous_release_found
 
-  if account_access_roles is not None:
-    statements=[]
-    for role in account_access_roles:
-      logger.info("Setting bucket policy for %s", bucket_name)
-      principal_dict = {"AWS": role['principal_arn']}
-      sid=''.join(filter(str.isalpha,(role['principal_arn'].rsplit('/',1))))
-      action = role['actions']
-      CommonUtil.set_bucket_policy(bucket=bucket_name,
-                                  principal=principal_dict,
-                                  policy_name=sid,
-                                  action=action
-                                  )
+    - name: deployARSParser | Archive the existing parser release
+      archive:
+        path: "{{ release_path }}"
+        dest: "{{ parserBackup }}"
+        format: gz
+        mode: 0755
+      when:
+        - previous_release_found.stat.exists is defined
+        - previous_release_found.stat.exists
 
-  dest_bucket_name =  f"{app_env}-inventory-reports"
-  if bucket_name == dest_bucket_name:
-    logger.info("Setting inventory policy for %s", bucket_name)
-    principal_dict={"Service": "s3.amazonaws.com"}
-    CommonUtil.set_bucket_policy(bucket=bucket_name,
-                                  principal=principal_dict,
-                                  policy_name='AllowInventoryPolicy',
-                                  action=["s3:PutObject"]
-                                )
+    - name: deployARSParser | Remove existing expanded application, if exists
+      file:
+        path: "{{ release_path }}"
+        state: absent
 
-# determine if there are obsolete s3 folders and buckets
-# if found, check if empty
-# if empty, delete
-if 'obsolete_s3_folders' in config:
-  logger.info("Removing obsolete buckets and folders!")
-  obsolete_folders_list = config['obsolete_s3_folders']
-  deleted_s3_items=[] # collect the list of items deleted
-  undeleted_s3_items=[] # collect the list of items unable to be deleted
-  for obsolete_folder in obsolete_folders_list:
-    try:
-      folder=obsolete_folder['name']
-      prefix=None
-      if '/' in folder:
-        bucket_name,prefix=folder.split('/',1)
-        logger.debug("folder %s, bucket %s, prefix %s", folder, bucket_name, prefix)
-      else:
-        bucket_name = folder
-      bucket = boto3.resource('s3').Bucket(bucket_name)
-      if prefix is not None:
-        prefix = f"{prefix}/"
-      if CommonUtil.validate_s3_access(bucket=bucket_name,prefix=prefix):
-        count=CommonUtil.list_with_versioning(bucket, prefix=prefix)
-        logger.debug("count %s", len(list(count)))
-        # if folder is empty, it will be a list of itself only
-        if len(list(count)) <= 1:
-          logger.info("prepare to delete %s", folder)
-          CommonUtil.permanently_delete_object(bucket=bucket, object_key=prefix)
-          if not CommonUtil.validate_s3_access(bucket=bucket_name,prefix=prefix):
-            deleted_s3_items.append(folder)
-        else:
-          logger.info("%s is not empty", folder)
-          undeleted_s3_items.append(folder)
-    except s3_resource.meta.client.exceptions.NoSuchBucket:
-      logger.info("%s does not exist, perhaps it is already deleted", obsolete_folder['name'])
-      deleted_s3_items.append(obsolete_folder['name'])
-    except ClientError as ce:
-      logger.error("exception: %s", ce)
+    - name: deployARSParser | Ensure release directory exists
+      file:
+        path: "{{ release_path }}"
+        state: directory
+        owner: "{{ ars_default_user_name }}"
+        group: "{{ ars_default_user_group }}"
+        mode: '0755'
 
-  for removed in deleted_s3_items:
-    logger.debug("deleted %s", removed)
-  for item in undeleted_s3_items:
-    logger.debug("Unable to delete %s", item)
+    #####################################################################
+    ### the following tasks setup the application configuration       ###
+    #####################################################################
 
-  message = "S3 Folder cleanup report"
-  if len(undeleted_s3_items) > 0:
-    logger.info("Send notice of folders not deleted")
-    message = "Unable to delete the following items.\n"
-    message += "Please verify the buckets/folders are empty.\n\t"
-    message += '\n\t'.join(undeleted_s3_items)
-  else:
-    message += "\nThere were no undeleted folders."
-  if len(deleted_s3_items) > 0:
-    message += "\n\nThe following items were successfully deleted:\n\t"
-    message += '\n\t'.join(deleted_s3_items)
-  else:
-    message += "\nThere were no folders deleted for this run."
+    - name: deployARSParser | Copy {{ archive_name.dest }} to {{ ars_parser_run_dir }} if jar
+      copy:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ ars_parser_run_dir }}/275generation.jar"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
 
-  subject = app_env + "-s3-folder-cleanup"
-  topic_arn=f"{config['sns_arn']}:{config['s3_bucket_cleanup_sns_topic']}"
+    - name: deployARSParser | Remove obsolete files and directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ archive_name.dest }}"
+        - "{{ ars_default_user_home }}/{{ app_name }}"
+        - "{{ ars_parser_run_dir }}/{{ app_name }}"
+        - "{{ ansible_env.HOME }}/releases/{{ app_name }}"
 
-  msg_id = CommonUtil.send_sns_message(
-                              topic=config['s3_bucket_cleanup_sns_topic'],
-                              topic_arn=topic_arn,
-                              message_string=message,
-                              subject=subject
-                              )
+    - name: deployARSParser | Verify s3write group exists
+      group:
+        name: "{{ s3_mount_group }}"
+        gid: 700
 
-  logger.info('Message published to topic %s, with message id %s',topic_arn,msg_id)
+    - name: deployARSParser | Create Mounts for external files using s3fs
+      include_tasks: ../tasks/configureS3Mounts.yml
+      vars:
+        s3_bucket_name: "{{ s3_bucket.name | lower }}"
+        s3_bucket_mount_name: "{{ s3_bucket.mount_name | lower }}"
+      when: s3_bucket.mount_name is defined
+      with_items: "{{ s3_buckets | default([]) }}"
+      loop_control:
+        loop_var: s3_bucket
+
+    - name: deployARSParser | Cleanup obsolete fstab entries for S3 mount
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: '^[#]*\/mnt\/s3.*'
+
+    - name: deployARSParser | Remove obsolete mounts
+      shell: "umount {{ ars_default_user_home }}/{{ item.path }}" # noqa command-instead-of-shell
+      register: unmount_bindings
+      changed_when: false
+      failed_when:
+        - unmount_bindings.stderr is defined
+        - unmount_bindings.stderr | length > 0
+        - not ("'not mounted' in unmount_bindings.stderr" and "'not found' in unmount_bindings.stderr")
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "unmount {{ ars_default_user_home }}/{{ item.path }}"
+
+    - name: deployARSParser | Cleanup directories before linking
+      file:
+        path: "{{ ars_default_user_home }}/{{ item.path }}"
+        state: absent
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "Cleanup {{ ars_default_user_home }}/{{ item.path }}"
+
+    - name: deployARSParser | Trigger handlers
+      meta: flush_handlers
+      tags:
+        - always
+
+    - name: deployARSParser | Create Symlinks to S3
+      file:
+        path: "{{ ars_default_user_home }}/{{ item.path }}"
+        src: "{{ s3_mount_root }}/{{ ars_default_user_name | lower }}/{{ item.source }}"
+        owner: "{{ ars_default_user_name }}"
+        group: "{{ ars_default_user_group }}"
+        state: link
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "Create Symlink to {{ s3_mount_root }}/{{ ars_default_user_name | lower }}/{{ item.source }}"
+
+    - name: deployARSParser | Verify symlinks exist
+      stat:
+        path: "{{ ars_default_user_home }}/{{ item.path }}"
+      loop: "{{ s3_bindings }}"
+      loop_control:
+        label: "Verify {{ ars_default_user_home }}/{{ item.path }}"
+      register: links
+      failed_when: links.stat.islnk is not defined
+
+    - name: deployARSParser | Add existing user to group {{ s3_mount_group }}
+      user:
+        name: "{{ item }}"
+        groups: "{{ s3_mount_group }}"
+        append: yes
+      loop:
+        - "{{ ars_default_user_name }}"
+
+    - name: deployARSParser | Create configuration and script files
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode | default('0644') }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        force: true
+        backup: true
+      register: set_context
+      with_items:
+        - src: "../templates/ars/run-ars-parser.sh.j2"
+          dest: "{{ ars_parser_run_dir }}/run-ars-ingest.sh"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0755'
+        - src: "../templates/ars/run-ars-parser.sh.j2"
+          dest: "{{ ars_parser_run_dir }}/run-ars-unmatch.sh"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0755'
+        - src: "../templates/ars/run-ars-parser.sh.j2"
+          dest: "{{ ars_parser_run_dir }}/run-ars-pedmatch.sh"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0755'
+        - src: "../templates/ars/{{ app_name }}.application.properties.j2"
+          dest: "{{ ars_parser_run_dir }}/parser.properties"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0644'
+        - src: "../templates/ars/{{ app_name }}.log4j2.xml.j2"
+          dest: "{{ ars_parser_run_dir }}/log4j2.xml"
+          owner: "{{ ars_default_user_name }}"
+          group: "{{ ars_default_user_group }}"
+          mode: '0644'
+        - src: "../templates/ars/checkmounts.sh.j2"
+          dest: "/usr/local/bin/checkmounts.sh"
+          owner: "root"
+          group: "{{ s3_mount_group }}"
+          mode: '2755'
+        - src: "../templates/ars/{{ app_name }}-cwagent-logs.json.j2"
+          dest: "{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json"
+          owner: "root"
+          group: "root"
+          mode: '0755'
+      loop_control:
+        label: "deploy {{ item.src }}"
+      tags:
+        - skip_ansible_lint
+
+    - name: deployARSParser | Find backups of parser scripts and clean them up
+      shell: |
+        set -o pipefail;
+        ls -t {{ ars_parser_run_dir }} | grep run-ars.*sh.[0-9]* | tail -n +{{ backup_to_keep + 1 }}
+      failed_when: false
+      register: old_parser_scripts
+
+    - name: deployARSParser | Remove old parser scripts
+      file:
+        path: "{{ ars_parser_run_dir }}/{{ item }}"
+        state: absent
+      with_items: "{{ old_parser_scripts.stdout_lines }}"
+      when: old_parser_scripts.stdout_lines is defined
+
+    ###############################################
+    ### append configure cloudwatch agent to ship logs ###
+    ###############################################
+    - name: deployARSParser | Append the new config to start command
+      ansible.builtin.command: >
+        {{ aws_cwagent_ctl }}
+        -a append-config -m {{ aws_cwagent_mode }}
+        -c file:'{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json'
+        -s
+      notify: get_cwagent_status
+    #############################################################################
+    ### the following tasks are just to support logging our actual deployment ###
+    #############################################################################
+
+    - name: deployARSParser | Ensure deployment logging for server exists
+      file:
+        path: "{{ item.src }}"
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+      with_items:
+        - { src: /var/log/deployments }
+
+    - name: deployARSParser | Find all the jar files for {{ app_name }}
+      find:
+        path: "{{ release_path }}"
+        patterns: "{{ item }}*.jar"
+        recurse: yes
+      loop: ["275generation"]
+      register: found_app_jars
+      tags:
+        - find_manifest
+
+    - name: deployARSParser | What jar files did we find (increase verbosity to 3 to see)
+      debug:
+        var: found_app_jars
+        verbosity: 3
+
+    - name: deployARSParser | Set fact for manifest collector
+      set_fact:
+        manifest_collector: []
+
+    - name: deployARSParser | Parse the deployed manifest files
+      include_tasks: ../tasks/parseJarManifests.yml
+      loop: "{{ found_app_jars.results | map(attribute='files') | list }}"
+      loop_control:
+        loop_var: jar_name
+
+    - name: deployARSParser | Get the username running the deploy
+      command: whoami
+      delegate_to: localhost
+      register: username_on_the_host
+      changed_when: False
+      become: no
+
+    - name: deployARSParser | Update server deployment history
+      lineinfile:
+        dest: "/var/log/deployments/{{ app_name }}_{{ env }}_deploymentHistory.log"
+        line: >
+          "{{ date_string }},
+          {{ username_on_the_host.stdout }},
+          {{ app_name }},
+          {{ inventory_hostname }},
+          {% set files = [] -%}
+          {%- for key in manifest_collector.keys() if key.split('/')[-1] not in files -%}{{ files.append(key.split('/')[-1]) }}{%- endfor -%}
+          {{ files | join(',' ) }},
+          {{ deployment_filename }}"
+        create: yes
+        insertafter: EOF
+        state: present
+        mode: 0644
+      tags: find_manifest
+
+    - name: deployARSParser | Setup Crontab
+      ansible.builtin.include_tasks: ../tasks/configureCrontab.yml
+      vars:
+        application: "{{ app_name }}"
+        crontab_entries: "{{ parser_crontab_entries }}"
+
+    - name: deployARSParser | Send Email to users
+      community.general.mail:
+        subject: "Deployment completed for ARS Parser {{ env | upper }}"
+        body: "{{ lookup('template', '../templates/ars/deployment_notification_body.j2') }}"
+        from: jenkins@{{ inventory_hostname }} (AWS Automation)
+        to: "{{ ars_be_notification_list }}"
+        cc:
+          - "{{ default_reply_email }}"
+        headers:
+          - Reply-To="{{ default_reply_email }}"
+          - X-Special="Notification for deployment"
+        subtype: html
+      vars:
+        paragraph1: "Deployment env: {{ friendly_env }}"
+        paragraph2: |
+          APP NAME: {{ app_name }}</br>
+          Deployed Date: {{ date_string }}</br>
+          Deployed To: {{ inventory_hostname }}</br>
+          Details:</br>
+          {% for key, value in manifest_collector.items() %}
+          {% if value is string %}
+          {{ key }}:</br>{{ value }}</br>
+          {% else %}
+          {{ key }}:</br>{{ value | list | join ('</br>') }}
+          {% endif %}
+          {% endfor %}
+      failed_when: false
+      tags: skip_ansible_lint
+
+    # it is safe to ignore these errors, it is just a cleanup task to remove old backups
+    - name: deployARSParser | List old backups and clean them up
+      ansible.builtin.shell: |
+        set -o pipefail;
+        ls -t {{ backup_path }} | grep parserBackup_ | tail -n +{{ backup_to_keep + 1 }}
+      register: ls_output
+      become: true
+      changed_when: false
+      ignore_errors: true
+
+    - name: deployARSParser | Remove the old backups
+      file:
+        path: "{{ backup_path }}/{{ item }}"
+        state: absent
+      with_items: "{{ ls_output.stdout_lines }}"
+      when: ls_output.stdout_lines is defined
+
+  handlers:
+    - name: reload_mount
+      ansible.builtin.shell: |
+        fusermount -uz {{ s3_mount_root }}/ars;
+        mount -a;
+      tags:
+        - skip_ansible_lint
+
+    - name: get_cwagent_status
+      ansible.builtin.command: >
+        {{ aws_cwagent_install_path }}/bin/{{ aws_cwagent_package }}-ctl
+        -m ec2
+        -a status
+      register: cwagent_status
+      failed_when: >
+        cwagent_status.rc > 0 or
+        'running' not in cwagent_status.stdout
+      notify: print_cwagent_status
+
+    - name: print_cwagent_status
+      ansible.builtin.debug:
+        msg: "{{ cwagent_status.stdout }}"
+      when:
+        - cwagent_status.stdout is defined
+        - cwagent_status.stdout | length > 0
