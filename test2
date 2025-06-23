@@ -1,10 +1,470 @@
-Error: Task name 'CRUDCFResources | Set Necessary Facts' is not unique. It was first used on line 50.
-Error: Task name 'configureWebserver | Trigger handlers' is not unique. It was first used on line 76.
-Error: Task name 'configureWebserver | Trigger handlers' is not unique. It was first used on line 76.
-Warning: File permissions unset or incorrect.
-Error: Task name 'deployFPPSAPI | Open firewall ports ( rhel-{{ rhel_version }} )' is not unique. It was first used on line 352.
-Warning: File permissions unset or incorrect.
-Error: Task name 'deployFPPSBackend | Trigger handlers' is not unique. It was first used on line 145.
-Warning: File permissions unset or incorrect.
-Warning: File permissions unset or incorrect.
-Error: Task name 'install-cwagent | Include playbook pre tasks' is not unique. It was first used on line 27.
+ - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref_name }}
+
+      - name: Get short SHA for IMAGE_TAG
+        run: |
+          sha=`echo ${GITHUB_SHA} | cut -c1-7`
+          echo "IMAGE_TAG=`echo $VERSION-${sha}`" >> $GITHUB_ENV
+
+      - name: Set ECR_BASE for branch builds
+        if: github.ref_name == 'develop'
+        run: echo "ECR_BASE=dev" >> $GITHUB_ENV
+
+      - name: Setup dotnet ${{ matrix.dotnet-version }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet-version }}
+          dotnet-quality: ga
+
+      - name: Add GitHub as NuGet Source
+        run: |
+          dotnet nuget add source ${{ env.NUGET_URL }} \
+          -n github \
+          -u ${{ secrets.REGISTRY_USER }} \
+          -p ${{ secrets.REGISTRY_TOKEN }} \
+          --store-password-in-clear-text
+
+      - name: Clean project ${{ matrix.dotnet-version }}
+        run: |
+          cd $DIR_ROOT/$PROJ_NAME
+          dotnet nuget locals all --clear
+          dotnet clean $PROJ_FILE
+
+      - name: Build ${{ matrix.dotnet-version }}
+        if: ${{ matrix.experimental == 'false' }}
+        run: |
+          cd $DIR_ROOT/$PROJ_NAME
+          dotnet publish $PROJ_FILE --configuration $BUILD_CONFIGURATION --output ./app /p:InformationalVersion=$IMAGE_TAG /p:Company="${COMPANY}" /p:Copyright="${COPYRIGHT}" /p:Version=$VERSION /p:Product="${PRODUCT_NAME}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@master
+        with:
+          role-to-assume: ${{ inputs.ROLE }}
+          aws-region: us-gov-west-1
+          role-duration-seconds: 1200
+          role-session-name: build-image
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check Docker Version
+        run: docker --version
+
+      - name: Execute docker build to build image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          cd $DIR_ROOT
+          ECR_IMAGE="${REPO}"
+          REPO="${ECR_BASE}-${REPO}"
+          BUILD_ARGS=(--build-arg APP_ENV=${ECR_BASE} --build-arg APP_PROJ_NAME=$PROJ_NAME --build-arg ECR_IMAGE=${ECR_IMAGE}:${IMAGE_TAG})
+          # Build a docker container
+          docker build -t $ECR_REGISTRY/$REPO:$IMAGE_TAG -t $ECR_REGISTRY/$REPO:latest -f ${GITHUB_WORKSPACE}/$DOCKER_FILE ${BUILD_ARGS[@]} .
+
+      - name: Push Docker image to ECR
+        if: github.event_name != 'pull_request'
+        id: push-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "Pushing image to ECR"
+          REPO="${ECR_BASE}-${REPO}"
+          docker push $ECR_REGISTRY/$REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$REPO:latest
+          echo "image=$ECR_REGISTRY/$REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Image Tags" >> $GITHUB_STEP_SUMMARY
+          echo "$ECR_REGISTRY/$IMAGE_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "pushed to $ECR_REGISTRY/$IMAGE_NAME " >> $GITHUB_STEP_SUMMARY
+
+      - name: Log out of Amazon ECR
+        if: always()
+        run: docker logout ${{ steps.login-ecr.outputs.registry }}
+
+
+
+name: Common CI workflow to run unit and specflow tests
+
+on:
+  workflow_call:
+    inputs:
+      SOLUTION:
+        required: true
+        type: string
+      TRANS_TYPE:
+        required: true
+        type: string
+      ROLE:
+        required: true
+        type: string
+    secrets:
+      MSSQL_DOCKER_PASS:
+        required: true
+      REGISTRY_USER:
+        required: true
+      REGISTRY_TOKEN:
+        required: true
+
+permissions:
+    id-token: write
+    contents: read
+    actions: read
+    security-events: write
+    checks: write
+
+jobs:
+  Unit_Test:
+    name: RunUnitTests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: PayerEDI.TAS.CXM
+    timeout-minutes: 20
+    env:
+      NUGET_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      config: 'Release'
+      unit_test_filter: "TestCategory=UnitTest"
+      solution_file: ${{ inputs.SOLUTION }}
+      transaction_type: ${{ inputs.TRANS_TYPE }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dotnet-version: '8.x'
+            experimental: 'false'
+            framework: net8.0
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@master
+      with:
+        role-to-assume: ${{ inputs.ROLE }}
+        aws-region: us-gov-west-1
+        role-duration-seconds: 1200
+        role-session-name: build-image
+        audience: sts.amazonaws.com
+
+    - name: Get EDI Nation Token
+      uses: aws-actions/aws-secretsmanager-get-secrets@v2
+      with:
+        secret-ids: |
+          ,ped-dev-edi-nation-token
+        parse-json-secrets: true
+
+    - name: Clean previous run
+      run: |
+        if [ -f _unittest.sln ]; then rm _unittest.sln; fi
+        rm -rf ${{ github.workspace }}/TestResults
+
+    - name: Set Branch
+      id: get_branch
+      run: |
+            if ${{ github.event_name == 'pull_request' }}
+            then
+              echo "BRANCH_NAME=${GITHUB_HEAD_REF}" >> $GITHUB_OUTPUT
+            else
+              echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+            fi
+
+    - name: Show Branch name
+      run: echo ${{ steps.get_branch.outputs.BRANCH_NAME }}
+
+    - name: Set pr build number
+      id: PRNUMBER
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        echo "pr=${{ github.event.number }}" >> $GITHUB_OUTPUT
+
+      # set report file and title
+    - name: Set Test Title and filename for PR
+      id: test_title
+      run: |
+            if ${{ github.event_name == 'pull_request' }}
+            then
+              echo "test_title=Unit Test Run for PR #${{steps.PRNUMBER.outputs.pr}} (${{github.run_number}})" >> $GITHUB_OUTPUT
+              echo "test_file_name=TestReport.${{steps.PRNUMBER.outputs.pr}}.${{github.run_number}}" >> $GITHUB_OUTPUT
+            else
+              echo "test_title=Unit Test Run ${{github.run_number}}" >> $GITHUB_OUTPUT
+              echo "test_file_name=TestReport.${{ steps.get_branch.outputs.BRANCH_NAME }}.${{github.run_number}}" >> $GITHUB_OUTPUT
+            fi
+
+    - name: Setup dotnet ${{ matrix.dotnet-version }}
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ matrix.dotnet-version }}
+        dotnet-quality: ga
+
+    - name: Install ReportGenerator
+      run: dotnet tool install -g dotnet-reportgenerator-globaltool
+
+    - name: Add GitHub as NuGet Source
+      run: |
+        dotnet nuget add source ${{ env.NUGET_URL }} \
+        -n github \
+        -u ${{ secrets.REGISTRY_USER }} \
+        -p ${{ secrets.REGISTRY_TOKEN }} \
+        --store-password-in-clear-text
+
+    - name: Clean project ${{ matrix.dotnet-version }}
+      run: dotnet clean $solution_file
+
+    - name: Build ${{ matrix.dotnet-version }}
+      run: >
+        dotnet build $solution_file
+        --configuration $config
+        --property:OutputPath=./bin/$config/${{ matrix.framework }}
+
+    - name: Create unitttest solution file
+      if: always()
+      run: dotnet new sln --name _unittest
+
+    - name: Populate unittest solution file
+      run: |
+        find .  -name "*Test*.csproj" -not -name "*Spec*" -not -name "*Library*" -exec dotnet sln _unittest.sln add {} \;
+
+    - name: Run Unit Tests ${{ matrix.dotnet-version }}
+      run: >
+        dotnet test _unittest.sln
+        --no-build
+        --verbosity normal
+        --configuration $config
+        --property:OutputPath=./bin/$config/${{ matrix.framework }}
+        --filter $unit_test_filter
+        --results-directory ${{ github.workspace }}/TestResults/Unit
+        --logger:"trx;"
+        --logger:"html;"
+
+    - name: Comment PR for failed unit tests
+      uses: mshick/add-pr-comment@v2
+      if: ${{ github.event_name == 'pull_request' && failure() && ! matrix.experimental }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+        repo-token-user-login: 'github-actions[bot]'
+        message: "**Pull request fails unit tests. See Test Results on action details**"
+        allow-repeats: true
+
+    - name: Unit Test Report
+      uses: dorny/test-reporter@v1
+      if: always()     # run this step even if previous step failed
+      with:
+        name: Unit Tests ${{ matrix.dotnet-version }}          # Name of the check run which will be created
+        path: ${{ github.workspace }}/TestResults/Unit/*.trx    # Path to test results
+        reporter: dotnet-trx        # Format of test results
+        # Set action as failed if test report contains any failed test
+        fail-on-error: 'true'
+
+    - name: Show Unit Test Results ${{ matrix.dotnet-version }}
+      if: always()
+      run: |
+        ls -al ${{ github.workspace }}/TestResults/Unit
+        echo ===============
+        linkstart=$(cat <<link_start
+        <br><a href="http://department-of-veterans-affairs.github.io/ped-services-$transaction_type/${{ steps.get_branch.outputs.BRANCH_NAME }}
+        link_start
+        )
+
+        linkend=$(cat << 'link_end'
+        "</a>
+        link_end
+        )
+
+        htmlhead=$(cat << 'html_head'
+        <html><head><title>Github Actions Unit Test Results</title></head><body>
+        html_head
+        )
+
+        htmlend=$(cat << 'html_end'
+        </body></html>
+        html_end
+        )
+
+        cd ${{ github.workspace }}/TestResults/Unit
+        echo "${htmlhead}" > index.html
+        find *  -type f -name "*.html" ! -name 'index.html' -exec echo "${linkstart}/{}${linkend}{}"  >> index.html \;
+        find *  -type f -name "*.trx" -exec echo "${linkstart}/{}${linkend}{}"  >> index.html \;
+        echo "${htmlend}" >> index.html
+        echo ===============
+        echo "http://department-of-veterans-affairs.github.io/ped-services-$transaction_type/${{ steps.get_branch.outputs.BRANCH_NAME }}/Unit"
+
+  Specflow_Test:
+    name: RunSpecFlowTests
+    needs: [Unit_Test]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: PayerEDI.TAS.CXM
+    timeout-minutes: 30
+    env:
+      NUGET_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      config: 'Release'
+      specflow_test_filter: "TestCategory=UnitTest"
+      solution_file: ${{ inputs.SOLUTION }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dotnet-version: '8.x'
+            experimental: 'false'
+            framework: net8.0
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@master
+      with:
+        role-to-assume: ${{ inputs.ROLE }}
+        aws-region: us-gov-west-1
+        role-duration-seconds: 1200
+        role-session-name: build-image
+        audience: sts.amazonaws.com
+
+    - name: Get EDI Nation Token
+      uses: aws-actions/aws-secretsmanager-get-secrets@v2
+      with:
+        secret-ids: |
+          ,ped-dev-edi-nation-token
+        parse-json-secrets: true
+
+    - name: Clean previous run
+      run: |
+        if [ -f _unittest.sln ]; then rm _unittest.sln; fi
+        rm -rf ${{ github.workspace }}/TestResults
+
+    - name: Set Branch
+      id: get_branch
+      run: |
+            if ${{ github.event_name == 'pull_request' }}
+            then
+              echo "BRANCH_NAME=${GITHUB_HEAD_REF}" >> $GITHUB_OUTPUT
+            else
+              echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+            fi
+
+    - name: Show Branch name
+      run: echo ${{ steps.get_branch.outputs.BRANCH_NAME }}
+
+    - name: Set pr build number
+      id: PRNUMBER
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        echo "pr=${{ github.event.number }}" >> $GITHUB_OUTPUT
+
+      # set report file and title
+    - name: Setup dotnet ${{ matrix.dotnet-version }}
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ matrix.dotnet-version }}
+      # build project
+
+    - name: Add GitHub as NuGet Source
+      run: |
+        dotnet nuget add source ${{ env.NUGET_URL }} \
+        -n github \
+        -u ${{ secrets.REGISTRY_USER }} \
+        -p ${{ secrets.REGISTRY_TOKEN }} \
+        --store-password-in-clear-text
+
+    - name: Clean project ${{ matrix.dotnet-version }}
+      run: dotnet clean $solution_file
+
+    - name: Build ${{ matrix.dotnet-version }}
+      run: >
+        dotnet build $solution_file
+        --configuration $config
+        --property:OutputPath=./bin/$config/${{ matrix.framework }}
+
+      # set report file and title
+    - name: Set Test Title and filename for PR
+      id: test_title
+      run: |
+            if ${{ github.event_name == 'pull_request' }}
+            then
+              echo "test_title=Specflow Test Run for PR #${{steps.PRNUMBER.outputs.pr}} (${{github.run_number}})" >> $GITHUB_OUTPUT
+              echo "test_file_name=TestReport.${{steps.PRNUMBER.outputs.pr}}.${{github.run_number}}" >> $GITHUB_OUTPUT
+            else
+              echo "test_title=Specflow Test Run ${{github.run_number}}" >> $GITHUB_OUTPUT
+              echo "test_file_name=TestReport.${{ steps.get_branch.outputs.BRANCH_NAME }}.${{github.run_number}}" >> $GITHUB_OUTPUT
+            fi
+
+    - name: Run SpecFlow Tests ${{ matrix.dotnet-version }}
+      if: always()
+      run: >
+        dotnet test $solution_file
+        --no-build
+        --verbosity normal
+        --configuration $config
+        --property:OutputPath=./bin/$config/${{ matrix.framework }}
+        --filter $specflow_test_filter
+        --results-directory ${{ github.workspace }}/TestResults/Spec
+        --logger:"trx;"
+        --logger:"html;"
+
+    - name: Comment PR for failed spec flow tests
+      uses: mshick/add-pr-comment@v2
+      if: ${{ github.event_name == 'pull_request' && failure() && ! matrix.experimental }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+        repo-token-user-login: 'github-actions[bot]'
+        message: "**Pull request fails Specflow tests. See Test Results on action details**"
+        allow-repeats: true
+
+    - name: Specflow Test Report
+      uses: dorny/test-reporter@v1
+      if: success() || failure()    # run this step even if previous step failed
+      with:
+        name: SpecFlow Tests ${{ matrix.dotnet-version }}           # Name of the check run which will be created
+        path: ${{ github.workspace }}/TestResults/Spec/*.trx    # Path to test results
+        reporter: dotnet-trx        # Format of test results
+        # Set action as failed if test report contains any failed test
+        fail-on-error: 'true'
+
+    - name: Show Specflow Test Results ${{ matrix.dotnet-version }}
+      if: always()
+      run: |
+        ls -al ${{ github.workspace }}/TestResults/Spec
+        echo ===============
+        linkstart=$(cat <<link_start
+        <br><a href="http://department-of-veterans-affairs.github.io/ped-services-$transaction_type/${{ steps.get_branch.outputs.BRANCH_NAME }}
+        link_start
+        )
+
+        linkend=$(cat << 'link_end'
+        "</a>
+        link_end
+        )
+
+        htmlhead=$(cat << 'html_head'
+        <html><head><title>Github Actions Unit Test Results</title></head><body>
+        html_head
+        )
+
+        htmlend=$(cat << 'html_end'
+        </body></html>
+        html_end
+        )
+
+        cd ${{ github.workspace }}/TestResults/Spec
+
+        find *  -type f -name "*.html" ! -name 'index.html' -exec echo "${linkstart}/{}${linkend}{}"  >> index.html \;
+        find *  -type f -name "*.trx" -exec echo "${linkstart}/{}${linkend}{}"  >> index.html \;
+        echo "${htmlend}" >> index.html
+        echo ===============
+        echo "http://department-of-veterans-affairs.github.io/ped-services-$transaction_type/${{ steps.get_branch.outputs.BRANCH_NAME }}/Spec"
