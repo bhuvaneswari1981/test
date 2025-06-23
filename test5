@@ -1,0 +1,19 @@
+The documentation for this Lambda function is available in the wiki.
+
+Issue:
+The error "NoneType: 'type' attribute" occurs when the relevant path for a file is not found in the database.
+The Lambda function reads files one by one from the evaluation folder, looks up the relevant path in the database, and moves the file to that path. If the relevant path is not found, the Lambda throws a "NoneType" attribute error, which can be observed in the Lambda logs.
+
+Fix:
+We have added an exception handler and an additional condition to catch this scenario. If the relevant path is missing, the function will now skip moving the file instead of failing with an error.
+
+How to Test:
+To simulate this scenario:
+
+Place a file in the evaluation folder that has no corresponding relevant path in the database,
+OR
+
+Manually remove the database entry for a known file.
+
+Then, trigger the Lambda and verify that it handles the missing path gracefully and logs the expected message without throwing an error.
+
