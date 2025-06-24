@@ -1,92 +1,4 @@
- - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref_name }}
-
-      - name: Get short SHA for IMAGE_TAG
-        run: |
-          sha=`echo ${GITHUB_SHA} | cut -c1-7`
-          echo "IMAGE_TAG=`echo $VERSION-${sha}`" >> $GITHUB_ENV
-
-      - name: Set ECR_BASE for branch builds
-        if: github.ref_name == 'develop'
-        run: echo "ECR_BASE=dev" >> $GITHUB_ENV
-
-      - name: Setup dotnet ${{ matrix.dotnet-version }}
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ matrix.dotnet-version }}
-          dotnet-quality: ga
-
-      - name: Add GitHub as NuGet Source
-        run: |
-          dotnet nuget add source ${{ env.NUGET_URL }} \
-          -n github \
-          -u ${{ secrets.REGISTRY_USER }} \
-          -p ${{ secrets.REGISTRY_TOKEN }} \
-          --store-password-in-clear-text
-
-      - name: Clean project ${{ matrix.dotnet-version }}
-        run: |
-          cd $DIR_ROOT/$PROJ_NAME
-          dotnet nuget locals all --clear
-          dotnet clean $PROJ_FILE
-
-      - name: Build ${{ matrix.dotnet-version }}
-        if: ${{ matrix.experimental == 'false' }}
-        run: |
-          cd $DIR_ROOT/$PROJ_NAME
-          dotnet publish $PROJ_FILE --configuration $BUILD_CONFIGURATION --output ./app /p:InformationalVersion=$IMAGE_TAG /p:Company="${COMPANY}" /p:Copyright="${COPYRIGHT}" /p:Version=$VERSION /p:Product="${PRODUCT_NAME}"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@master
-        with:
-          role-to-assume: ${{ inputs.ROLE }}
-          aws-region: us-gov-west-1
-          role-duration-seconds: 1200
-          role-session-name: build-image
-          audience: sts.amazonaws.com
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Check Docker Version
-        run: docker --version
-
-      - name: Execute docker build to build image
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          cd $DIR_ROOT
-          ECR_IMAGE="${REPO}"
-          REPO="${ECR_BASE}-${REPO}"
-          BUILD_ARGS=(--build-arg APP_ENV=${ECR_BASE} --build-arg APP_PROJ_NAME=$PROJ_NAME --build-arg ECR_IMAGE=${ECR_IMAGE}:${IMAGE_TAG})
-          # Build a docker container
-          docker build -t $ECR_REGISTRY/$REPO:$IMAGE_TAG -t $ECR_REGISTRY/$REPO:latest -f ${GITHUB_WORKSPACE}/$DOCKER_FILE ${BUILD_ARGS[@]} .
-
-      - name: Push Docker image to ECR
-        if: github.event_name != 'pull_request'
-        id: push-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          echo "Pushing image to ECR"
-          REPO="${ECR_BASE}-${REPO}"
-          docker push $ECR_REGISTRY/$REPO:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$REPO:latest
-          echo "image=$ECR_REGISTRY/$REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "Image Tags" >> $GITHUB_STEP_SUMMARY
-          echo "$ECR_REGISTRY/$IMAGE_NAME" >> $GITHUB_STEP_SUMMARY
-          echo "pushed to $ECR_REGISTRY/$IMAGE_NAME " >> $GITHUB_STEP_SUMMARY
-
-      - name: Log out of Amazon ECR
-        if: always()
-        run: docker logout ${{ steps.login-ecr.outputs.registry }}
-
-
-
+# Updated ci.yml with strict build rules
 name: Common CI workflow to run unit and specflow tests
 
 on:
@@ -117,8 +29,60 @@ permissions:
     checks: write
 
 jobs:
+  # Add pre-build quality check job
+  code-quality-check:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: PayerEDI.TAS.CXM
+    timeout-minutes: 10
+    env:
+      NUGET_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      solution_file: ${{ inputs.SOLUTION }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup dotnet 8.x
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.x'
+        dotnet-quality: ga
+
+    - name: Install dotnet format tool
+      run: dotnet tool install -g dotnet-format
+
+    - name: Add GitHub as NuGet Source
+      run: |
+        dotnet nuget add source ${{ env.NUGET_URL }} \
+        -n github \
+        -u ${{ secrets.REGISTRY_USER }} \
+        -p ${{ secrets.REGISTRY_TOKEN }} \
+        --store-password-in-clear-text
+
+    - name: Restore dependencies
+      run: dotnet restore $solution_file
+
+    - name: Check code formatting
+      run: dotnet format $solution_file --verify-no-changes --verbosity diagnostic
+      continue-on-error: false
+
+    - name: Security vulnerability check
+      run: |
+        dotnet list package --vulnerable --include-transitive 2>&1 | tee vulnerability-report.txt
+        if grep -q "has the following vulnerable packages" vulnerability-report.txt; then
+          echo "::error::Vulnerable packages detected"
+          cat vulnerability-report.txt
+          exit 1
+        fi
+
   Unit_Test:
     name: RunUnitTests
+    needs: [code-quality-check]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -217,11 +181,21 @@ jobs:
     - name: Clean project ${{ matrix.dotnet-version }}
       run: dotnet clean $solution_file
 
-    - name: Build ${{ matrix.dotnet-version }}
+    # Enhanced build step with strict rules
+    - name: Build ${{ matrix.dotnet-version }} with Strict Rules
       run: >
         dotnet build $solution_file
         --configuration $config
+        --verbosity normal
         --property:OutputPath=./bin/$config/${{ matrix.framework }}
+        --property WarningsAsErrors=true
+        --property TreatWarningsAsErrors=true
+        --property WarningsNotAsErrors=""
+        --property EnforceCodeStyleInBuild=true
+        --property RunAnalyzersDuringBuild=true
+        --property RunCodeAnalysis=true
+        /p:StyleCopEnabled=true
+        /p:StyleCopTreatErrorsAsWarnings=false
 
     - name: Create unitttest solution file
       if: always()
@@ -231,17 +205,23 @@ jobs:
       run: |
         find .  -name "*Test*.csproj" -not -name "*Spec*" -not -name "*Library*" -exec dotnet sln _unittest.sln add {} \;
 
-    - name: Run Unit Tests ${{ matrix.dotnet-version }}
+    # Enhanced test run with strict settings
+    - name: Run Unit Tests ${{ matrix.dotnet-version }} with Strict Rules
       run: >
         dotnet test _unittest.sln
         --no-build
         --verbosity normal
         --configuration $config
         --property:OutputPath=./bin/$config/${{ matrix.framework }}
+        --property WarningsAsErrors=true
+        --property TreatWarningsAsErrors=true
         --filter $unit_test_filter
         --results-directory ${{ github.workspace }}/TestResults/Unit
         --logger:"trx;"
         --logger:"html;"
+        --collect:"XPlat Code Coverage"
+        /p:CollectCoverage=true
+        /p:CoverletOutputFormat=opencover
 
     - name: Comment PR for failed unit tests
       uses: mshick/add-pr-comment@v2
@@ -383,11 +363,21 @@ jobs:
     - name: Clean project ${{ matrix.dotnet-version }}
       run: dotnet clean $solution_file
 
-    - name: Build ${{ matrix.dotnet-version }}
+    # Enhanced build step with strict rules
+    - name: Build ${{ matrix.dotnet-version }} with Strict Rules
       run: >
         dotnet build $solution_file
         --configuration $config
+        --verbosity normal
         --property:OutputPath=./bin/$config/${{ matrix.framework }}
+        --property WarningsAsErrors=true
+        --property TreatWarningsAsErrors=true
+        --property WarningsNotAsErrors=""
+        --property EnforceCodeStyleInBuild=true
+        --property RunAnalyzersDuringBuild=true
+        --property RunCodeAnalysis=true
+        /p:StyleCopEnabled=true
+        /p:StyleCopTreatErrorsAsWarnings=false
 
       # set report file and title
     - name: Set Test Title and filename for PR
@@ -402,7 +392,8 @@ jobs:
               echo "test_file_name=TestReport.${{ steps.get_branch.outputs.BRANCH_NAME }}.${{github.run_number}}" >> $GITHUB_OUTPUT
             fi
 
-    - name: Run SpecFlow Tests ${{ matrix.dotnet-version }}
+    # Enhanced test run with strict settings
+    - name: Run SpecFlow Tests ${{ matrix.dotnet-version }} with Strict Rules
       if: always()
       run: >
         dotnet test $solution_file
@@ -410,10 +401,15 @@ jobs:
         --verbosity normal
         --configuration $config
         --property:OutputPath=./bin/$config/${{ matrix.framework }}
+        --property WarningsAsErrors=true
+        --property TreatWarningsAsErrors=true
         --filter $specflow_test_filter
         --results-directory ${{ github.workspace }}/TestResults/Spec
         --logger:"trx;"
         --logger:"html;"
+        --collect:"XPlat Code Coverage"
+        /p:CollectCoverage=true
+        /p:CoverletOutputFormat=opencover
 
     - name: Comment PR for failed spec flow tests
       uses: mshick/add-pr-comment@v2
