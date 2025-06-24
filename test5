@@ -1,19 +1,57 @@
-The documentation for this Lambda function is available in the wiki.
+# Add code formatting check before build
+      - name: Install dotnet format tool
+        run: dotnet tool install -g dotnet-format
 
-Issue:
-The error "NoneType: 'type' attribute" occurs when the relevant path for a file is not found in the database.
-The Lambda function reads files one by one from the evaluation folder, looks up the relevant path in the database, and moves the file to that path. If the relevant path is not found, the Lambda throws a "NoneType" attribute error, which can be observed in the Lambda logs.
+      - name: Check code formatting
+        run: |
+          cd $DIR_ROOT/$PROJ_NAME
+          dotnet format $PROJ_FILE --verify-no-changes --verbosity diagnostic
+        continue-on-error: false
 
-Fix:
-We have added an exception handler and an additional condition to catch this scenario. If the relevant path is missing, the function will now skip moving the file instead of failing with an error.
+      # Enhanced build step with strict rules
+      - name: Build ${{ matrix.dotnet-version }} with Strict Rules
+        if: ${{ matrix.experimental == 'false' }}
+        run: |
+          cd $DIR_ROOT/$PROJ_NAME
+          dotnet publish $PROJ_FILE \
+            --configuration $BUILD_CONFIGURATION \
+            --output ./app \
+            --verbosity normal \
+            --property WarningsAsErrors=true \
+            --property TreatWarningsAsErrors=true \
+            --property WarningsNotAsErrors="" \
+            --property EnforceCodeStyleInBuild=true \
+            --property GenerateDocumentationFile=true \
+            --property RunAnalyzersDuringBuild=true \
+            --property RunCodeAnalysis=true \
+            /p:InformationalVersion=$IMAGE_TAG \
+            /p:Company="${COMPANY}" \
+            /p:Copyright="${COPYRIGHT}" \
+            /p:Version=$VERSION \
+            /p:Product="${PRODUCT_NAME}" \
+            /p:StyleCopEnabled=true \
+            /p:StyleCopTreatErrorsAsWarnings=false
 
-How to Test:
-To simulate this scenario:
+      # Add security analysis step
+      - name: Run Security Analysis
+        run: |
+          cd $DIR_ROOT/$PROJ_NAME
+          dotnet list package --vulnerable --include-transitive 2>&1 | tee vulnerability-report.txt
+          if grep -q "has the following vulnerable packages" vulnerability-report.txt; then
+            echo "::error::Vulnerable packages detected"
+            cat vulnerability-report.txt
+            exit 1
+          fi
 
-Place a file in the evaluation folder that has no corresponding relevant path in the database,
-OR
-
-Manually remove the database entry for a known file.
-
-Then, trigger the Lambda and verify that it handles the missing path gracefully and logs the expected message without throwing an error.
-
+      # Add static code analysis
+      - name: Run Static Code Analysis
+        run: |
+          cd $DIR_ROOT/$PROJ_NAME
+          dotnet build $PROJ_FILE \
+            --configuration $BUILD_CONFIGURATION \
+            --verbosity normal \
+            --property WarningsAsErrors=true \
+            --property RunAnalyzersDuringBuild=true \
+            --property RunCodeAnalysis=true \
+            --property CodeAnalysisRuleSet=AllRules.ruleset \
+            --no-restore
