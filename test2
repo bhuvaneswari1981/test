@@ -21,3 +21,9 @@
       delegate_to: "{{ inventory_hostname }}"
       register: war_contents
       when: unzip_content.stdout | int < 2
+
+ - name: deployFPPSAPI  | Extract tar to  {{ release_path }}
+      command: "tar -xvf {{ local_stage_path }}/{{ deployment_tar_file.split('/')[-1] }} -C {{ release_path }}/"
+      when: unzip_content.stdout | int > 1
+      tags:
+        - skip_ansible_lint
