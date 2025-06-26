@@ -1,57 +1,7 @@
-# Add code formatting check before build
-      - name: Install dotnet format tool
-        run: dotnet tool install -g dotnet-format
-
-      - name: Check code formatting
-        run: |
-          cd $DIR_ROOT/$PROJ_NAME
-          dotnet format $PROJ_FILE --verify-no-changes --verbosity diagnostic
-        continue-on-error: false
-
-      # Enhanced build step with strict rules
-      - name: Build ${{ matrix.dotnet-version }} with Strict Rules
-        if: ${{ matrix.experimental == 'false' }}
-        run: |
-          cd $DIR_ROOT/$PROJ_NAME
-          dotnet publish $PROJ_FILE \
-            --configuration $BUILD_CONFIGURATION \
-            --output ./app \
-            --verbosity normal \
-            --property WarningsAsErrors=true \
-            --property TreatWarningsAsErrors=true \
-            --property WarningsNotAsErrors="" \
-            --property EnforceCodeStyleInBuild=true \
-            --property GenerateDocumentationFile=true \
-            --property RunAnalyzersDuringBuild=true \
-            --property RunCodeAnalysis=true \
-            /p:InformationalVersion=$IMAGE_TAG \
-            /p:Company="${COMPANY}" \
-            /p:Copyright="${COPYRIGHT}" \
-            /p:Version=$VERSION \
-            /p:Product="${PRODUCT_NAME}" \
-            /p:StyleCopEnabled=true \
-            /p:StyleCopTreatErrorsAsWarnings=false
-
-      # Add security analysis step
-      - name: Run Security Analysis
-        run: |
-          cd $DIR_ROOT/$PROJ_NAME
-          dotnet list package --vulnerable --include-transitive 2>&1 | tee vulnerability-report.txt
-          if grep -q "has the following vulnerable packages" vulnerability-report.txt; then
-            echo "::error::Vulnerable packages detected"
-            cat vulnerability-report.txt
-            exit 1
-          fi
-
-      # Add static code analysis
-      - name: Run Static Code Analysis
-        run: |
-          cd $DIR_ROOT/$PROJ_NAME
-          dotnet build $PROJ_FILE \
-            --configuration $BUILD_CONFIGURATION \
-            --verbosity normal \
-            --property WarningsAsErrors=true \
-            --property RunAnalyzersDuringBuild=true \
-            --property RunCodeAnalysis=true \
-            --property CodeAnalysisRuleSet=AllRules.ruleset \
-            --no-restore
+Run dotnet test _unittest.sln --no-build --verbosity normal --configuration $config --property:OutputPath=./bin/$config/net8.0 --property WarningsAsErrors=true --property TreatWarningsAsErrors=true --filter $unit_test_filter --results-directory /home/runner/work/ped-services-remediation/ped-services-remediation/TestResults/Unit --logger:"trx;" --logger:"html;"
+MSBUILD : error MSB1005: Specify a property and its value.
+    Full command line: '/usr/share/dotnet/sdk/8.0.411/MSBuild.dll -maxcpucount -verbosity:m -nologo -target:VSTest -nodereuse:false -nologo -property:VSTestTestCaseFilter="TestCategory=UnitTest" -property:VSTestLogger="trx%3b;html%3b" -property:VSTestNoBuild=true -property:VSTestResultsDirectory="/home/runner/work/ped-services-remediation/ped-services-remediation/TestResults/Unit" -property:Configuration=Release -verbosity:normal _unittest.sln --property:OutputPath=./bin/Release/net8.0 --property WarningsAsErrors=true --property TreatWarningsAsErrors=true -property:VSTestVerbosity=normal -property:VSTestArtifactsProcessingMode=collect -property:VSTestSessionCorrelationId=2664_08b3e21f-35da-458c-869d-ea4c5c6f670e'
+  Switches appended by response files:
+Switch: --property
+For switch syntax, type "MSBuild -help"
+Error: Process completed with exit code 1.
