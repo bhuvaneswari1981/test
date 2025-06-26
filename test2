@@ -1,29 +1,587 @@
- - name: deployFPPSAPI  | Inspect {{ deployment_filename }}
+---
+# Enhanced FPPS API Deployment Playbook with ZIP/TAR.GZ support
+- name: deployFPPSAPI | Deploy FPPS API Node Server
+  hosts: "{{ var_hosts }}"
+  gather_facts: true
+  remote_user: "{{ ansible_ssh_user }}"
+  become: true
+
+  roles:
+    - ansible-role-awscli
+
+  vars:
+    stage_path: ""
+    app_name: fpps-api
+    service_name: "fpps-nodeapi-server"
+    deployment_filename: "{{ lookup('ansible.builtin.env', 'deployment_filename') }}"
+    github_project_repo: fpps-api
+    local_stage_path: "{{ ansible_env.HOME }}/releases/{{ app_name }}"
+    release_path: "{{ fpps_default_user_home }}/{{ app_name }}"
+    tmp_path: "{{ ansible_env.HOME }}/releases/{{ app_name }}"
+    backup_path: "{{ ansible_env.HOME }}/releases/backups"
+    backup_to_keep: 10
+    date_string: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+    expected_node_version: "{{ nodejs_version }}"
+
+  pre_tasks:
+    - name: deployFPPSAPI | Include all files in vars
+      include_vars:
+        dir: ../vars/fpps-defaults
+        extensions:
+          - yml
+
+    - name: deployFPPSAPI | Include playbook pre tasks
+      include_tasks: ../tasks/playbookPreTasks.yml
+
+    # Enhanced: Determine archive type from deployment filename pattern
+    - name: deployFPPSAPI | Determine archive type
+      set_fact:
+        archive_type: "{{ 'zip' if '_NODE' in deployment_filename else 'tar.gz' }}"
+        archive_name_clean: "{{ deployment_filename | basename }}"
+
+    - name: deployFPPSAPI | Debug archive information
+      debug:
+        msg: 
+          - "Deployment filename: {{ deployment_filename }}"
+          - "Archive type detected: {{ archive_type }}"
+          - "Clean archive name: {{ archive_name_clean }}"
+
+  tasks:
+    - name: deployFPPSAPI | Verify Node js is installed
+      ansible.builtin.command: node --version
+      register: latest_node_version
+      changed_when: false
+
+    - name: deployFPPSAPI | Assert node version
+      assert:
+        that: (latest_node_version.stdout.split('v')[1]) is version(expected_node_version.replace('*','0'), '>=')
+        fail_msg: "ERROR: Node JS version {{ latest_node_version.stdout }} does not meet minimal acceptable version {{ expected_node_version }}"
+        success_msg: "SUCCESS: Node JS found ({{ latest_node_version.stdout }}) is acceptable"
+
+    - name: deployFPPSAPI | Create FPPS USER group(s)
+      group:
+        state: present
+        name: "{{ fpps_default_user_group }}"
+
+    - name: deployFPPSAPI | Create FPPS USER
+      user:
+        state: present
+        name: "{{ fpps_default_user_name }}"
+        home: "{{ fpps_default_user_home }}"
+        group: "{{ fpps_default_user_group }}"
+        create_home: true
+        comment: "FPPS user"
+
+    - name: deployFPPSAPI | Change ownership of FPPS USER HOME to allow group write
+      file:
+        state: directory
+        path: "{{ fpps_default_user_home }}"
+        mode: 0770
+
+    - name: deployFPPSAPI | Create rc files for Jenkins user to access Nexus
+      template:
+        src: ../templates/nexus/npmrc.j2
+        dest: "{{ item.dest }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+        backup: true
+      loop:
+        - { dest: "{{ jenkins_home }}/.npmrc", owner: "{{ jenkins_process_user }}", group: "{{ jenkins_process_group }}", mode: '0644' }
+        - { dest: "{{ fpps_default_user_home }}/.npmrc", owner: "{{ fpps_default_user_name }}", group: "{{ fpps_default_user_group }}", mode: '0644' }
+        - { dest: "/root/.npmrc", owner: "root", group: "root", mode: '0644' }
+      loop_control:
+        label: "Create {{ item.dest }}"
+
+    - name: deployFPPSAPI | Create backup filename
+      set_fact:
+        fpps_backup: "{{ backup_path }}/{{ app_name }}_bkp_{{ date_string }}"
+
+    - name: deployFPPSAPI | Ensure directories exist for application operation
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0755
+      with_items:
+        - "{{ tmp_path }}"
+        - "{{ backup_path }}"
+        - "{{ ansible_env.HOME }}/releases"
+        - /var/log/deployments
+
+    - name: deployFPPSAPI | Create externalized configuration files
+      template:
+        src: "../templates/fpps/{{ app_name }}-syslog.conf.j2"
+        dest: "/etc/rsyslog.d/{{ app_name }}-syslog.conf"
+        mode: "0640"
+        owner: "root"
+        group: "root"
+        force: true
+        backup: true
+      register: set_context
+
+    - name: deployFPPSAPI | Check if aws cw agent path exists
+      stat:
+        path: "{{ aws_cwagent_install_path }}"
+      register: aws_cwagent_present
+
+    - name: deployFPPSAPI | Update Cloudwatch Agent files
+      template:
+        src: "../templates/fpps/{{ app_name }}-cwagent-logs.json.j2"
+        dest: "{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json"
+        mode: 0755
+        owner: "root"
+        group: "root"
+      delegate_to: "{{ inventory_hostname }}"
+      failed_when: false
+      when: aws_cwagent_present.stat.exists
+
+    ###############################################
+    ### append configure cloudwatch agent to ship logs ###
+    ###############################################
+    - name: deployFPPSAPI | Append the new config to start command
+      ansible.builtin.command: >
+        {{ aws_cwagent_ctl }}
+        -a append-config -m {{ aws_cwagent_mode }}
+        -c file:'{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json'
+        -s
+      notify: get_cwagent_status
+      when: aws_cwagent_present.stat.exists
+
+#############################################################################
+### the following tasks are just to support logging our actual deployment ###
+#############################################################################
+    - name: deployFPPSAPI | Ensure deployment logging for staging server exists
+      file:
+        path: "{{ item.src }}"
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+      with_items:
+        - { src: /var/log/deployments }
+      delegate_to: localhost
+
+    - name: deployFPPSAPI | Get artifact branch
+      set_fact:
+        artifact_branch: "{{ 'develop' if app_env in ['dev','test'] else 'master' }}"
+
+    - name: deployFPPSAPI | Get archive from buildartifacts
+      include_tasks: ../tasks/sparse_checkout.yml
+      vars:
+        github_repo_name: "fpps-build-artifacts"
+        sparse_checkout: "{{ deployment_filename }}"
+        base_dir: "/opt/tmp"
+        branch: "{{ artifact_branch }}"
+
+    # Enhanced: Handle both ZIP and TAR.GZ extraction with content inspection
+    - name: deployFPPSAPI | Inspect {{ deployment_filename }}
       shell: |
         set -o pipefail
         unzip -l {{ archive_name.dest }} | grep .tar.gz | wc -l
       register: unzip_content 
+      when: archive_type == 'zip'
 
-    - name: deployFPPSAPI  | Unarchive {{ deployment_filename }}
+    - name: deployFPPSAPI | Debug unzip content inspection
+      debug:
+        msg: "Found {{ unzip_content.stdout | default('N/A') }} .tar.gz files in ZIP archive"
+      when: archive_type == 'zip'
+
+    - name: deployFPPSAPI | Unarchive {{ deployment_filename }} (ZIP with multiple tar.gz files)
       unarchive:
         src: "{{ archive_name.dest }}"
         dest: "{{ local_stage_path }}"
         remote_src: true
       delegate_to: "{{ inventory_hostname }}"
       register: unarchive_file
-      when: unzip_content.stdout | int > 1
+      when: archive_type == 'zip' and unzip_content.stdout | int > 1
 
-    - name: deployFPPSAPI  | Copy {{ deployment_filename }} to {{ local_stage_path }}
+    - name: deployFPPSAPI | Copy {{ deployment_filename }} to {{ local_stage_path }} (ZIP with single file)
       copy:
         src: "{{ archive_name.dest }}"
         dest: "{{ local_stage_path }}"
         remote_src: true
       delegate_to: "{{ inventory_hostname }}"
       register: war_contents
-      when: unzip_content.stdout | int < 2
+      when: archive_type == 'zip' and unzip_content.stdout | int < 2
 
- - name: deployFPPSAPI  | Extract tar to  {{ release_path }}
-      command: "tar -xvf {{ local_stage_path }}/{{ deployment_tar_file.split('/')[-1] }} -C {{ release_path }}/"
-      when: unzip_content.stdout | int > 1
+    - name: deployFPPSAPI | Unarchive {{ deployment_filename }} (TAR.GZ)
+      unarchive:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ local_stage_path }}"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
+      when: archive_type == 'tar.gz'
+
+    - name: deployFPPSAPI | Verify extraction was successful
+      stat:
+        path: "{{ local_stage_path }}"
+      register: extraction_check
+
+    - name: deployFPPSAPI | Assert extraction succeeded
+      assert:
+        that: extraction_check.stat.exists and (extraction_check.stat.isdir or extraction_check.stat.isreg)
+        fail_msg: "Archive extraction failed - {{ local_stage_path }} does not exist"
+        success_msg: "Archive extraction successful"
+
+    - name: deployFPPSAPI | Stop Service {{ service_name }}
+      systemd:
+        name: "{{ service_name }}"
+        state: stopped
+        daemon_reload: true
+      register: stop_service_result
+      failed_when:
+        - stop_service_result.msg is defined
+        - "'Could not find the requested service' not in stop_service_result.msg"
+
+    - name: deployFPPSAPI | Determine if there is an existing release
+      stat:
+        path: "{{ release_path }}"
+      register: fpps_stat
+
+    - name: deployFPPSAPI | Create backup of existing release
+      synchronize:
+        src: "{{ release_path }}"
+        dest: "{{ fpps_backup }}"
+        recursive: yes
+        perms: yes
+        owner: true
+        group: true
+        rsync_path: "sudo rsync" #use sudo on the remote systems
+      delegate_to: "{{ inventory_hostname }}"
+      when: fpps_stat.stat.exists
+
+    - name: deployFPPSAPI | Ensure "{{ release_path }}" exists
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ fpps_default_user_name }}"
+        group: "{{ fpps_default_user_group }}"
+        mode: 0755
+      with_items:
+        - "{{ release_path }}"
+
+    # Enhanced: Extract TAR.GZ from ZIP if needed
+    - name: deployFPPSAPI | Find TAR.GZ file in extracted ZIP contents
+      find:
+        paths: "{{ local_stage_path }}"
+        patterns: "*.tar.gz"
+        recurse: yes
+      register: tar_files_found
+      when: archive_type == 'zip' and unzip_content.stdout | int > 1
+
+    - name: deployFPPSAPI | Set TAR.GZ filename for extraction
+      set_fact:
+        deployment_tar_file: "{{ tar_files_found.files[0].path }}"
+      when: archive_type == 'zip' and unzip_content.stdout | int > 1 and tar_files_found.files | length > 0
+
+    - name: deployFPPSAPI | Extract tar to {{ release_path }}
+      command: "tar -xvf {{ deployment_tar_file }} -C {{ release_path }}/"
+      when: archive_type == 'zip' and unzip_content.stdout | int > 1 and deployment_tar_file is defined
       tags:
         - skip_ansible_lint
+
+    - name: deployFPPSAPI | Synchronize app source (for non-ZIP or single file ZIP)
+      synchronize:
+        src: "{{ local_stage_path }}/"
+        dest: "{{ release_path }}/"
+        recursive: yes
+        owner: no
+        group: no
+        delete: yes
+        rsync_path: "sudo rsync" #use sudo on the remote systems
+      delegate_to: "{{ inventory_hostname }}"
+      when: not (archive_type == 'zip' and unzip_content.stdout | int > 1)
+
+    - name: deployFPPSAPI | Touch log file for syslog
+      file:
+        path: "/var/log/{{ service_name }}.log"
+        owner: root
+        group: root
+        state: touch
+        mode: 0755
+
+    - name: deployFPPSAPI | Deploy {{ app_name }} service template /etc/systemd/system/{{ service_name }}
+      template:
+        src: "../templates/fpps/{{ service_name }}.service.j2"
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        mode: 0644
+        owner: "{{ fpps_default_user_name }}"
+        group: "{{ fpps_default_user_group }}"
+        backup: yes
+      tags:
+        - always
+
+    - name: deployFPPSAPI | Check if metaData.json exists
+      stat:
+        path: "{{ release_path }}/metaData.json"
+      register: metadata_file
+
+    - name: deployFPPSAPI | Importing the API MetaData contents to variable
+      slurp:
+        src: "{{ release_path }}/metaData.json"
+      register: api_metadata
+      when: metadata_file.stat.exists
+
+    - name: deployFPPSAPI | Set facts for FPPS API Meta Data (from file)
+      set_fact:
+        appName: "{{ (api_metadata.content | b64decode | from_json).appName }}"
+        distributionFileName: "{{ (api_metadata.content | b64decode | from_json).distributionFileName }}"
+        lastBuildDate: "{{ (api_metadata.content | b64decode | from_json).lastBuildDate }}"
+        distributionVersion: "{{ (api_metadata.content | b64decode | from_json).version }}"
+      when: metadata_file.stat.exists
+
+    # Enhanced: Fallback metadata when metaData.json doesn't exist
+    - name: deployFPPSAPI | Set fallback facts for FPPS API Meta Data
+      set_fact:
+        appName: "{{ app_name }}"
+        distributionFileName: "{{ archive_name_clean }}"
+        lastBuildDate: "{{ date_string }}"
+        distributionVersion: "{{ archive_name_clean | regex_search('\\d+\\.\\d+\\.\\d+') | default('unknown') }}"
+      when: not metadata_file.stat.exists
+
+    - name: deployFPPSAPI | Output meta
+      debug:
+        msg: "{{ appName }}, {{ distributionFileName }}, {{ lastBuildDate }}, {{ distributionVersion }}"
+      tags: find_meta
+
+    - name: deployFPPSAPI | Update FPPS env files
+      template:
+        src: "../templates/fpps/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: 0644
+        owner: "{{ fpps_default_user_name }}"
+        group: "{{ fpps_default_user_group }}"
+        backup: yes
+      delegate_to: "{{ inventory_hostname }}"
+      with_items:
+        - { src: "{{ app_name }}_dotenv.j2" , dest: "{{ release_path }}/.env"}
+      tags:
+        - skip_ansible_lint
+
+    - name: deployFPPSAPI | Ensure we start with a clean SELinux file context of {{ release_path }}
+      community.general.sefcontext:
+        path: '{{ release_path }}(/.*)?'
+        setype: initrc_exec_t
+        state: absent
+      failed_when: false
+
+    - name: deployFPPSAPI | Set SELinux file context of {{ release_path }}
+      community.general.sefcontext:
+        path: '{{ release_path }}(/.*)?'
+        setype: initrc_exec_t
+        state: present
+        reload: yes
+      register: content
+      failed_when: false
+
+    - name: deployFPPSAPI | Make {{ release_path }} tree readable
+      file:
+        path: "{{ release_path }}"
+        mode: 0755
+        owner: "{{ fpps_default_user_name }}"
+        group: "{{ fpps_default_user_group }}"
+        recurse: true
+
+    - name: deployFPPSAPI | Reload_selinux
+      ansible.builtin.command: restorecon -Rv {{ item }}
+      with_items:
+        - "{{ release_path }}"
+      changed_when: false
+      failed_when: false
+
+    - name: deployFPPSAPI | Reload systemd
+      ansible.builtin.command: systemctl daemon-reload
+      changed_when: false
+
+    # Enhanced: Install npm dependencies if package.json exists
+    - name: deployFPPSAPI | Check if package.json exists
+      stat:
+        path: "{{ release_path }}/package.json"
+      register: package_json
+
+    - name: deployFPPSAPI | Install npm dependencies
+      ansible.builtin.command:
+        cmd: npm install --production
+        chdir: "{{ release_path }}"
+      become_user: "{{ fpps_default_user_name }}"
+      when: package_json.stat.exists
+      register: npm_install_result
+      failed_when: npm_install_result.rc != 0
+
+    - name: deployFPPSAPI | Start Service {{ service_name }}
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        enabled: yes
+        daemon_reload: true
+      register: start_service_result
+      failed_when: "start_service_result is failed and ('find' not in start_service_result.msg and 'could not be found' not in start_service_result.msg)"
+      loop:
+        - "{{ service_name }}"
+        - rsyslog
+
+    - name: deployFPPSAPI | Wait for port 3000 to become open on the host, after 10 seconds
+      wait_for:
+        port: 3000
+        delay: 10
+        timeout: 150
+
+    # Verify that firewalld has opened the fpps_nodeapi_server_port
+    - name: deployFPPSAPI | Open firewall ports ( rhel-{{ rhel_version }} )
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        state: enabled
+        zone: public
+      with_items: "{{ fpps_nodeapi_server_port }}"
+      when: rhel_version | int == 7
+      notify: reload_firewalld
+
+    - name: deployFPPSAPI | Open firewall ports ( rhel-{{ rhel_version }} )
+      firewalld:
+        port: "{{ item.port }}/tcp"
+        permanent: true
+        state: "{{ item.state }}"
+        zone: "{{ item.zone }}"
+      loop:
+        - { port: "{{ fpps_nodeapi_server_port }}", state: enabled, zone: vaec }
+        - { port: "{{ fpps_nodeapi_server_port }}", state: disabled, zone: public }
+      when: rhel_version | int == 8
+      notify: reload_firewalld
+
+    # Restart firewalld
+    - name: configureWebserver | Trigger handlers
+      ansible.builtin.meta: flush_handlers
+      tags:
+        - always
+
+    - name: deployFPPSAPI | Get the username running the deploy
+      ansible.builtin.command: whoami
+      delegate_to: localhost
+      register: username_on_the_host
+      changed_when: false
+      become: no
+      tags: find_meta
+
+# the following does assume the backend is running and verifies communication between api and backend
+    - name: deployFPPSAPI | Verify health/check is accessible from API
+      uri:
+        url: "http://localhost:{{ fpps_nodeapi_server_port }}/home/health/check"
+        status_code: 200
+        validate_certs: false
+        return_content: yes
+        method: POST
+        body: ''
+        timeout: 15
+      until: appup.status == 200
+      retries: 30
+      delay: 5
+      register: appup
+      tags: find_manifest
+
+    - name: deployFPPSAPI | Show status of health check
+      debug:
+        var: appup.content
+
+    - name: deployFPPSAPI | Create playbook output log
+      copy:
+        content: |
+           APP NAME : {{ appName }}
+           Deployed Date : {{ date_string }}
+           Last Build Date : {{ lastBuildDate }}
+           Distribution Version : {{ distributionVersion }}
+           Distribution File Deployed : {{ distributionFileName }}
+           Archive Type : {{ archive_type }}
+        dest: "{{ playbook_dir }}/{{ app_name }}_{{ env }}_{{ inventory_hostname }}_{{ distributionVersion }}_siteInfo.log"
+        mode: 0755
+      delegate_to: localhost
+      tags: find_meta
+
+    - name: deployFPPSAPI | Update server deployment history
+      lineinfile:
+        dest: "/var/log/deployments/{{ app_name }}_{{ env }}_deploymentHistory.log"
+        line: >
+          "{{ date_string }},
+          {{ username_on_the_host.stdout }},
+          {{ appName }},
+          {{ distributionVersion }},
+          {{ distributionFileName }},
+          {{ archive_type }}"
+        create: yes
+        insertafter: EOF
+        state: present
+        mode: 0755
+      tags: find_meta
+
+    - name: deployFPPSAPI | Send Email to users
+      community.general.mail:
+        subject: "Deployment completed for FPPS API {{ env | upper }}"
+        body: "{{ lookup('template','../templates/fpps/deployment_notification_body.j2') }}"
+        from: jenkins@{{ inventory_hostname }} (AWS Automation)
+        to: "{{ fpps_api_notification_list }}"
+        cc:
+          - "{{ default_reply_email }}"
+        headers:
+          - Reply-To="{{ default_reply_email }}"
+          - X-Special="Notification for deployment"
+        subtype: html
+      vars:
+        paragraph1: "Deployment env: {{ friendly_env }}"
+        paragraph2: |
+           APP NAME : {{ appName }}<br>
+           Deployed Date : {{ date_string }}<br>
+           Last Build Date : {{ lastBuildDate }}<br>
+           Distribution Version : {{ distributionVersion }}<br>
+           Distribution File Deployed : {{ distributionFileName }}<br>
+           Archive Type : {{ archive_type }}<br>
+      failed_when: false
+
+    - name: deployFPPSAPI | Cleanup unarchived files
+      file:
+        path: "{{ tmp_path }}"
+        state: absent
+
+    - name: deployFPPSAPI | Collect list of backups eligible for cleanup
+      ansible.builtin.shell: |
+        set -o pipefail;
+        ls -t {{ backup_path }} | grep {{ app_name }}_bkp_ | tail -n +{{ backup_to_keep + 1 }}
+      register: ls_output
+      become: true
+      changed_when: false
+      failed_when: ls_output.rc > 1
+
+    - name: deployFPPSAPI | Remove backups eligible for cleanup
+      file:
+        path: "{{ backup_path }}/{{ item }}"
+        state: absent
+      with_items: "{{ ls_output.stdout_lines }}"
+      become: true
+      when:
+        - ls_output.stdout_lines is defined
+        - ls_output.stdout_lines | length > 0
+
+  handlers:
+    - name: get_cwagent_status
+      ansible.builtin.command: >
+        {{ aws_cwagent_install_path }}/bin/{{ aws_cwagent_package }}-ctl
+        -m ec2
+        -a status
+      register: cwagent_status
+      failed_when: >
+        cwagent_status.rc > 0 or
+        'running' not in cwagent_status.stdout
+      notify: print_cwagent_status
+
+    - name: print_cwagent_status
+      debug:
+        msg: "{{ cwagent_status.stdout }}"
+      when:
+        - cwagent_status.stdout is defined
+        - cwagent_status.stdout | length > 0
+
+    - name: reload_firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
