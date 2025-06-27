@@ -1,3 +1,2 @@
-GM Bhuvane - if you're being asked by others, please reply to them & just let me know others are "on it"
-But the question has come up: Why does Geoff's team (e-Reimb) have a requirement to go thru Beta prior to Dev? Or is this a misconception on their part?
- 
+"That's correct - our standard flow is beta → dev → test → preprod → prod. All teams, including e-Reimb, follow this same pipeline. Beta comes first as part of our standard process."
+
