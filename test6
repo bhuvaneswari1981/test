@@ -1,2 +1,7 @@
-"That's correct - our standard flow is beta → dev → test → preprod → prod. All teams, including e-Reimb, follow this same pipeline. Beta comes first as part of our standard process."
-
+- name: deployFPPSAPI | Detect archive type by file command
+  shell: file {{ archive_name.dest }}
+  register: file_type
+  
+- name: deployFPPSAPI | Set archive type from file inspection  
+  set_fact:
+    archive_type: "{{ 'zip' if 'Zip archive' in file_type.stdout else 'tar.gz' }}"
