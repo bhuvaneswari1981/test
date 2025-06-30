@@ -1,9 +1,1 @@
- - name: "{{ app_env }}-834-eligibility-plus-flow"
-      role_arn: "{{ iam_arn }}:role/project/{{ sfn_iam_role }}"
-      batch_resource_pattern: "834eligibilityplus.*"
-      sns_topic: "{{ app_env }}-834-eligibility-plus-not-processed"
-      job_queue_type: "{{ job_queue_834 | default('r6i') }}"
-      wait_time: 1440
-      sfn_timeout: 87000
-      batch_stack: "834_batch_stack"
-      ready_for_promote: ["beta", "dev", "test", "eeltest", "eretest", "ecltest", "pte", "preprod"]
+I heard you will be leaving for few weeks due to a family emergency. I hope and pray safe travels for you and that all goes well. There is nothing more important than family. Take care and thank you so much for all that you do for the team each and every day.
