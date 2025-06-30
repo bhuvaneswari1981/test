@@ -1,1 +1,405 @@
+---
+# create/check release folder
+# copy public to remote folder
+- name: deployFPPSBackend | Deploy FPPS Backend
+  hosts: "{{ var_hosts }}"
+  gather_facts: true
+  remote_user: "{{ ansible_ssh_user }}"
+  become: true
 
+  roles:
+    - ansible-role-awscli
+
+  vars:
+    stage_path: ""
+    app_name: "fpps-backend"
+    deployment_filename: "{{ lookup('ansible.builtin.env', 'deployment_filename') }}"
+    github_project_repo: fpps-backend
+    local_stage_path: "{{ tomcat_webapps }}/fpps.war"
+    date_string: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+    fppsPropFileLocation: "{{ fpps_default_user_home }}/{{ app_name }}/WEB-INF/classes/application.properties"
+
+  pre_tasks:
+    - name: deployFPPSBackend | Include all files in vars
+      include_vars:
+        dir: ../vars/fpps-defaults
+        extensions:
+          - yml
+
+    - name: deployFPPSBackend | Include playbook pre tasks
+      include_tasks: ../tasks/playbookPreTasks.yml
+
+  tasks:
+
+    - name: deployFPPSBackend | Stop and disable Apache HTTPD
+      systemd:
+        name: httpd
+        state: stopped
+        enabled: no
+        daemon_reload: yes
+      register: httpd_stop_result
+      failed_when:
+        - httpd_stop_result is failed
+        - "'Could not find the requested service' not in httpd_stop_result.msg"
+
+    - name: deployFPPSBackend | Create FPPS USER group(s)
+      group:
+        state: present
+        name: "{{ fpps_default_user_group }}"
+
+    - name: deployFPPSBackend | Create FPPS USER
+      user:
+        state: present
+        name: "{{ fpps_default_user_name }}"
+        home: "{{ fpps_default_user_home }}"
+        group: "{{ fpps_default_user_group }}"
+        create_home: true
+        comment: "FPPS user"
+
+    - name: deployFPPSBackend | Change ownership of FPPS USER HOME to allow group write
+      file:
+        state: directory
+        path: "{{ fpps_default_user_home }}"
+        mode: 0770
+
+    - name: deployFPPSBackend | Create rc files for Jenkins user to access Nexus
+      template:
+        src: ../templates/nexus/npmrc.j2 # noqa no-relative-paths
+        dest: "{{ item.dest }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+        backup: yes
+      loop:
+        - { dest: "{{ jenkins_home }}/.npmrc", owner: "{{ jenkins_process_user }}", group: "{{ jenkins_process_group }}", mode: '0644' }
+        - { dest: "{{ fpps_default_user_home }}/.npmrc", owner: "{{ fpps_default_user_name }}", group: "{{ fpps_default_user_group }}", mode: '0644' }
+        - { dest: "/root/.npmrc", owner: "root", group: "root", mode: '0644' }
+      loop_control:
+        label: "Create {{ item.dest }}"
+
+    - name: deployFPPSBackend | Get artifact branch
+      set_fact:
+        artifact_branch: "{{ 'develop' if app_env in ['dev','test'] else 'master' }}"
+
+    - name: deployFPPSBackend | Get archive from buildartifacts
+      include_tasks: ../tasks/sparse_checkout.yml
+      vars:
+        github_repo_name: "fpps-build-artifacts"
+        sparse_checkout: "{{ deployment_filename }}"
+        base_dir: "/opt/tmp"
+        branch: "{{ artifact_branch }}"
+
+    - name: deployFPPSBackend | Remove existing expanded application, if exists
+      file:
+        path: "{{ local_stage_path | regex_replace('.war', '') }}"
+        state: absent
+      notify: restart_tomcat
+
+    - name: deployFPPSBackend | List location of archive name
+      debug:
+        msg: "archive {{ archive_name.url }} saved to {{ archive_name.dest }}"
+      when: archive_name is defined
+
+    - name: deployFPPSBackend | Copy {{ deployment_filename }} to {{ local_stage_path }}
+      copy:
+        src: "{{ archive_name.dest }}"
+        dest: "{{ local_stage_path }}"
+        remote_src: true
+      delegate_to: "{{ inventory_hostname }}"
+
+    #####################################################################
+    ### the following tasks setup the application configuration       ###
+    #####################################################################
+    - name: deployFPPSBackend | Ensure directories exist for application operation
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      with_items:
+        - { path: "{{ tomcat_logs }}", mode: '0775', owner: "{{ tomcat_default_user_name }}", group: "{{ tomcat_default_user_group }}" }
+        - { path: "{{ fpps_default_user_home }}/{{ app_name }}/WEB-INF/classes", mode: '0755', owner: "{{ fpps_default_user_name }}", group: "{{ fpps_default_user_group }}" }
+        - { path: "{{ fpps_default_user_home }}/fpps_emails", mode: '0775', owner: "{{ fpps_default_user_name }}", group: "{{ fpps_default_user_group }}" }
+        - { path: "{{ fpps_default_user_home }}/generated_reports", mode: '2770', owner: "{{ fpps_default_user_name }}", group: "{{ fpps_default_user_group }}" }
+      loop_control:
+        label: "Create {{ item.path }}"
+
+    - name: deployFPPSBackend | Trigger handlers
+      meta: flush_handlers
+
+    - name: deployFPPSBackend | Add {{ tomcat_default_user_name }} user to group {{ fpps_default_user_group }}
+      user:
+        name: "{{ tomcat_default_user_name }}"
+        groups: "{{ fpps_default_user_group }}"
+        append: true
+
+    - name: deployFPPSBackend | Create externalized configuration files
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: 0644
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        force: true
+        backup: true
+      register: set_context
+      with_items:
+        - src: "../templates/fpps/{{ app_name }}.xml.j2"
+          dest: "{{ tomcat_conf }}/Catalina/localhost/fpps.xml"
+          owner: "{{ tomcat_default_user_name }}"
+          group: "{{ tomcat_default_user_group }}"
+        - src: "../templates/fpps/{{ app_name }}.application.properties.j2"
+          dest: "{{ fppsPropFileLocation }}"
+          owner: "{{ fpps_default_user_name }}"
+          group: "{{ fpps_default_user_group }}"
+        - src: "../templates/fpps/{{ app_name }}.log4j2.properties.j2"
+          dest: "{{ fpps_default_user_home }}/{{ app_name }}/WEB-INF/classes/log4j2.properties"
+          owner: "{{ fpps_default_user_name }}"
+          group: "{{ fpps_default_user_group }}"
+      notify: restart_tomcat
+      loop_control:
+        label: "deploy {{ item.src }}"
+      tags:
+        - skip_ansible_lint
+
+    - name: deployFPPSBackend | Check if aws cw agent path exists
+      stat:
+        path: "{{ aws_cwagent_install_path }}"
+      register: aws_cwagent_present
+
+    - name: deployFPPSBackend | Update Cloudwatch Agent files
+      template:
+        src: "../templates/fpps/{{ app_name }}-cwagent-logs.json.j2"
+        dest: "{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json"
+        mode: 0755
+        owner: "root"
+        group: "root"
+      delegate_to: "{{ inventory_hostname }}"
+      failed_when: false
+      when: aws_cwagent_present.stat.exists
+
+    - name: deployFPPSBackend | Remove existing obsolete file from user home
+      file:
+        path: "{{ fpps_default_user_home }}/{{ app_name }}/WEB-INF/web.xml"
+        state: absent
+      notify: restart_tomcat
+
+    - name: deployFPPSBackend | Make {{ fpps_default_user_home }}/{{ app_name }} tree readable by {{tomcat_default_user_name}}
+      acl:
+        path: "{{ fpps_default_user_home }}/{{ app_name }}"
+        entity: "{{ tomcat_default_user_name }}"
+        etype: user
+        permissions: rwx
+        state: present
+        recursive: yes
+
+    - name: deployFPPSBackend | Make {{ fpps_default_user_home }} tree readable by {{ tomcat_default_user_name }}
+      acl:
+        path: "{{ fpps_default_user_home }}"
+        entity: "{{ tomcat_default_user_name }}"
+        etype: user
+        permissions: rwx
+        state: present
+
+    - name: deployFPPSBackend | Trigger handlers
+      meta: flush_handlers
+      tags:
+        - always
+
+    - name: deployFPPSBackend | Ensure SELinux allows the httpd server to connect with external networks
+      command: /sbin/setsebool -P httpd_can_network_connect 1
+      changed_when: false
+
+    - name: deployFPPSBackend | Set logrotation
+      ansible.builtin.template:
+        src: ../templates/fpps/logrotate.j2
+        dest: "/etc/logrotate.d/{{ app_name }}"
+        mode: 0644
+        force: yes
+      register: tomcat_logrotate
+      notify: restart_tomcat
+      tags:
+        - always
+
+    ###############################################
+    ### append configure cloudwatch agent to ship logs ###
+    ###############################################
+    - name: deployFPPSBackend | Append the new config to start command
+      command: >
+        {{ aws_cwagent_ctl }}
+        -a append-config -m {{ aws_cwagent_mode }}
+        -c file:'{{ aws_cwagent_install_path }}/etc/{{ app_name }}-cwagent-logs.json'
+        -s
+      notify: get_cwagent_status
+      when: aws_cwagent_present.stat.exists
+
+    ################################################
+    ### establish the healthiness of the backend ###
+    ################################################
+
+    - name: deployFPPSBackend | Wait for tomcat service to be ready
+      wait_for:
+        port: "{{ fpps_api_port }}"
+        host: 127.0.0.1
+        connect_timeout: 5
+        delay: 5
+        timeout: 300
+
+    - name: deployFPPSBackend | Verify version.properties file exists in {{ local_stage_path | regex_replace('.war', '') }} dir
+      assert:
+        that:
+          - "'{{ local_stage_path | regex_replace('.war', '') }}/WEB-INF/classes/version.properties'"
+        fail_msg: "version.properties file doesn't exists"     
+
+    - name: deployFPPSBackend | Importing the Backend MetaData contents to variable
+      slurp:
+        src: "{{ local_stage_path | regex_replace('.war', '') }}/WEB-INF/classes/version.properties"
+      register: backend_metadata
+
+    - name: deployFPPSBackend | Decode the backend metadata content
+      set_fact: 
+        meta_content: "{{ (backend_metadata['content'] | b64decode ) }}"
+        
+    - name: deployFPPSBackend | Extract metadata key value pairs and convert to dict
+      set_fact:
+        meta_dict: "{{ meta_dict | default({}) | combine({ key: value }) }}"
+      loop: "{{ meta_content.splitlines() }}"
+      vars:
+        key: "{{ item.split('=')[0].strip() }}"
+        value: "{{ item.split('=')[1].strip() }}"
+      when: item | length > 0 and '=' in item
+      
+    - name: deployFPPSBackend | Convert metadata dictionary to json content
+      set_fact:
+         meta_json_content: "{{ meta_dict | to_json(indent=2) }}"         
+ 
+    - name: deployFPPSBackend | Parse the metadata Json file
+      set_fact:
+        json_data: "{{ meta_json_content | from_json }}"
+
+    - name: deployFPPSBackend | Set facts for Backend Meta Data
+      set_fact:
+        appName: "{{ json_data['product'] }}"
+        distributionFileName: "{{ json_data['distributionFileName'] }}"
+        lastBuildDate: "{{ json_data['buildTime'] }}"
+        distributionVersion: "{{ json_data['version'] }}"
+
+    - name: deployFPPSBackend | Output meta
+      debug:
+        msg: "{{ appName }}, {{ distributionFileName }}, {{ lastBuildDate }}, {{ distributionVersion }}"
+      tags: find_meta
+
+    - name: deployFPPSBackend | Get the username running the deploy
+      command: whoami
+      delegate_to: localhost
+      register: username_on_the_host
+      changed_when: False
+      become: no
+      tags:
+        - find_manifest
+
+    - name: deployFPPSBackend | Verify {{ fpps_backend_health_route }} is accessible
+      uri:
+        url: "http://localhost:{{ fpps_api_port }}{{ fpps_backend_health_route }}"
+        status_code: 200
+        validate_certs: false
+        return_content: yes
+        timeout: 15
+      until: appup.status == 200
+      retries: 30
+      delay: 5
+      register: appup
+      tags: find_manifest
+
+    - name: deployFPPSBackend | Show status of health check
+      debug:
+        var: appup.content
+
+    - name: deployFPPSBackend | Collect results of content returned
+      set_fact:
+        app_running: "{{ appup.content | regex_replace('^.*<p>(.*)</p>.*', '\\1') }}"
+        line_items: "{{ appup.content | regex_replace('^.*<ul>(.*)</ul>.*', '\\1') | replace('<li>', '\n')| replace('</li>', '') }}"
+
+#############################################################################
+### the following tasks are just to support logging our actual deployment ###
+#############################################################################
+    - name: deployFPPSBackend | Ensure logging for server exists
+      file:
+        path: "{{ item.src }}"
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+      with_items:
+        - { src: /var/log/deployments }
+
+    - name: deployFPPSBackend | Update server deployment history
+      lineinfile:
+        dest: "/var/log/deployments/{{ app_name }}_{{ env }}_deploymentHistory.log"
+        line: >
+          "{{ date_string }},
+          {{ username_on_the_host.stdout }},
+          {{ appName }},
+          {{ distributionVersion }},
+          {{ distributionFileName }}"
+        create: yes
+        insertafter: EOF
+        state: present
+        mode: 0755
+      tags: find_manifest
+
+    - name: deployFPPSBackend | Send Email to users
+      community.general.mail:
+        subject: "Deployment completed for FPPS Backend {{ env | upper }}"
+        body: "{{ lookup('template','../templates/fpps/deployment_notification_body.j2') }}"
+        from: jenkins@{{ inventory_hostname }} (AWS Automation)
+        to: "{{ fpps_be_notification_list }}"
+        cc:
+          - "{{ default_reply_email }}"
+        headers:
+          - Reply-To="{{ default_reply_email }}"
+          - X-Special="Notification for deployment"
+        subtype: html
+      vars:
+        paragraph1: "Deployment env: {{ friendly_env }}"
+        paragraph2: |
+           APP NAME : {{ appName }}<br>
+           Deployed Date : {{ date_string }}<br>
+           Last Build Date : {{ lastBuildDate }}<br>
+           Distribution Version : {{ distributionVersion }}<br>
+           Distribution File Deployed : {{ distributionFileName }}<br>
+           {{ appup.content }}<br>
+      failed_when: false
+
+  handlers:
+    - name: restart_tomcat
+      systemd:
+        name: tomcat
+        state: restarted
+        daemon_reload: yes
+      register: tomcat_status
+
+    - name: reload_mount
+      ansible.builtin.command:
+        cmd: "mount -a"
+      tags:
+        - skip_ansible_lint
+
+    - name: get_cwagent_status
+      command: >
+        {{ aws_cwagent_install_path }}/bin/{{ aws_cwagent_package }}-ctl
+        -m ec2
+        -a status
+      register: cwagent_status
+      failed_when: >
+        cwagent_status.rc > 0 or
+        'running' not in cwagent_status.stdout
+      notify: print_cwagent_status
+
+    - name: print_cwagent_status
+      debug:
+        msg: "{{ cwagent_status.stdout }}"
+      when:
+        - cwagent_status.stdout is defined
+        - cwagent_status.stdout | length > 0
