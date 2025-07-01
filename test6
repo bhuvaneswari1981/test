@@ -1,5 +1,16 @@
-PEDI-34943 - tomcat 11
-PEDI-34367 - Java (in concert with tomcat 11)
-PEDI-34362 - Angular (in concert with tomcat & Java)
-PEDI-35277 - bug fix in parser image gen
-PEDI-34426 - CM issue in test env, not present in other envs [PEDI-34426 is a CM (database?) change - not an ARS code change?]
+TASK [deployFPPSBackend | Inspect backend/fpps-backend-2.2.1-2df13b1-125.war] ***
+Tuesday 01 July 2025  20:34:53 +0000 (0:00:00.020)       0:07:05.380 ********** 
+: FAILED! => 
+    changed: true
+    cmd: |-
+        set -o pipefail
+        unzip -l /opt/tmp/fpps-build-artifacts/backend/fpps-backend-2.2.1-2df13b1-125.war | grep fpps.war | wc -l
+    delta: '0:00:00.047855'
+    end: '2025-07-01 20:34:54.107190'
+    msg: non-zero return code
+    rc: 1
+    start: '2025-07-01 20:34:54.059335'
+    stderr: ''
+    stderr_lines: <omitted>
+    stdout: '0'
+    stdout_lines: <omitted>
