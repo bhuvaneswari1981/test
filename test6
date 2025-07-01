@@ -1,23 +1,5 @@
-- name: deployFPPSBackend | Inspect {{ deployment_filename }}
-      shell: |
-        set -o pipefail
-        unzip -l {{ archive_name.dest }} | grep fpps.war | wc -l
-      register: unzip_content
-
-    - name: deployFPPSBackend | Unarchive {{ deployment_filename }}
-      unarchive:
-        src: "{{ archive_name.dest }}"
-        dest: "{{ tomcat_webapps }}"
-        remote_src: true
-      delegate_to: "{{ inventory_hostname }}"
-      register: unarchive_file
-      when: unzip_content.stdout | int == 1
-
-- name: deployFPPSBackend | Copy {{ deployment_filename }} to {{ local_stage_path }}
-       copy:
-        src: "{{ archive_name.dest }}"
-        dest: "{{ local_stage_path }}"
-        remote_src: true
-      delegate_to: "{{ inventory_hostname }}"
-      register: war_contents
-      when: unzip_content.stdout | int == 0
+PEDI-34943 - tomcat 11
+PEDI-34367 - Java (in concert with tomcat 11)
+PEDI-34362 - Angular (in concert with tomcat & Java)
+PEDI-35277 - bug fix in parser image gen
+PEDI-34426 - CM issue in test env, not present in other envs [PEDI-34426 is a CM (database?) change - not an ARS code change?]
