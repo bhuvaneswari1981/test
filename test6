@@ -1,16 +1,5 @@
-TASK [deployFPPSBackend | Inspect backend/fpps-backend-2.2.1-2df13b1-125.war] ***
-Tuesday 01 July 2025  20:34:53 +0000 (0:00:00.020)       0:07:05.380 ********** 
-: FAILED! => 
-    changed: true
-    cmd: |-
-        set -o pipefail
-        unzip -l /opt/tmp/fpps-build-artifacts/backend/fpps-backend-2.2.1-2df13b1-125.war | grep fpps.war | wc -l
-    delta: '0:00:00.047855'
-    end: '2025-07-01 20:34:54.107190'
-    msg: non-zero return code
-    rc: 1
-    start: '2025-07-01 20:34:54.059335'
-    stderr: ''
-    stderr_lines: <omitted>
-    stdout: '0'
-    stdout_lines: <omitted>
+I’ve generated a diff report comparing the prod and dev branches. The report outlines the files that have been added, modified, or deleted between the two versions.
+
+Please find the attached diff_report.txt for your review.
+
+Let me know if you'd like the changes categorized further or exported in a different format (e.g., CSV or Excel).
