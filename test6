@@ -1,7 +1,318 @@
-(
-  echo "=== Commit Log ==="
-  git log prod..dev --pretty=format:"%h | %s"
-  echo ""
-  echo "=== File Changes (Status | Path) ==="
-  git diff --name-status prod..dev
-) > /c/bhuvana/prod_dev_diff_full_report.txt
+def print_resource_versions(app_env="", proj_list=None, configs=None, **kwargs):
+    """
+    Prints resource versions and deployment information for the specified environment.
+    This function processes and displays information about various AWS resources such as
+    Lambda functions, job definitions, ECR images, and triggers. It also reports on validation
+    results and deployment status.
+    Parameters:
+    -----------
+    app_env : str, optional
+      The application environment to process (e.g., "dev", "prod"). Defaults to empty string.
+    proj_list : list, optional
+      List of projects to process. Defaults to an empty list.
+    configs : dict, optional
+      Configuration settings for the resources.
+    **kwargs : dict
+      Optional arguments to process specific resource types:
+      - "ecr_images": Process ECR images only
+      - "lambdas": Process Lambda functions only
+      - "job_definition": Process job definitions only
+    Returns:
+    --------
+    None
+      This function logs the results to the configured logger.
+    Notes:
+    ------
+    The function displays:
+    - Resource information for the specified environment
+    - Validation results for non-deployed projects
+    - Deployment report including successfully updated Lambdas and Batch Jobs
+    - Any deployment validation failures
+    """
+    logger.info("*** Printing resources for environment: %s ***", app_env)
+    if proj_list is None:
+      proj_list=[]
+
+    if len(kwargs) == 0:
+      BatchUtil.handle_job_definitions(app_env=app_env, settings=configs)
+      CommonUtil.handle_lambdas(app_env=app_env,proj_list=proj_list, settings=configs)
+      CommonUtil.handle_triggers(app_env=app_env,proj_list=proj_list, settings=configs)
+      CommonUtil.handle_ecr_images(app_env=app_env, settings=configs)
+    else:
+      for key in kwargs:
+        arg_value = kwargs.get(key)
+        if arg_value == "ecr_images":
+          CommonUtil.handle_ecr_images(app_env=app_env, settings=configs)
+        elif arg_value == "lambdas":
+          CommonUtil.handle_lambdas(app_env=app_env,proj_list=proj_list, settings=configs)
+        elif arg_value == "job_definition":
+          BatchUtil.handle_job_definitions(app_env=app_env, settings=configs)
+        else:
+          logger.error("Invalid argument %s", arg_value)
+    if ValidateUtil.non_deployed_project_validation:
+      logger.info("***** Validation For Non Deployed Projects *****")
+      logger.info("Item Validation : %s", len(ValidateUtil.non_deployed_project_validation))
+      for item in sorted(ValidateUtil.non_deployed_project_validation,key=itemgetter('Type')):
+        logger.info(item)
+    logger.info("***** Deployment report *****")
+    if ValidateUtil.lambda_image_versions:
+      logger.info("Lambdas Updated Successfully: %s", len(ValidateUtil.lambda_image_versions))
+      for item in sorted(ValidateUtil.lambda_image_versions,key=itemgetter('Item')):
+        logger.info(item)
+    if ValidateUtil.job_image_versions:
+      logger.info("Batch Jobs Updated Successfully: %s", len(ValidateUtil.job_image_versions))
+      for item in sorted(ValidateUtil.job_image_versions,key=itemgetter('Item')):
+        logger.info(item)
+    if ValidateUtil.deployment_validation_failures:
+      logger.info("***** Deployment Validation Failures *****")
+      logger.info("Deployment Validation Issues: %s", len(ValidateUtil.deployment_validation_failures))
+      for item in sorted(ValidateUtil.deployment_validation_failures,key=itemgetter('Type')):
+        logger.info(item)
+def handle_lambdas(app_env=None,proj_list=None, settings=None):
+    """
+    Validates and retrieves information about AWS Lambda functions for a specific environment.
+    This function connects to AWS Lambda, lists all functions, and processes their versions
+    based on the provided environment and project filters. Results are returned as an ordered dictionary.
+    Args:
+      app_env (str, optional): The application environment to validate. If not provided,
+                    it will be retrieved from the APP_ENV environment variable.
+      proj_list (list, optional): List of projects to filter Lambda functions. If None,
+                    all Lambda functions will be processed.
+      settings (dict, optional): Configuration settings. If None, settings will be loaded
+                      from ansible config for the specified environment.
+    Returns:
+      OrderedDict: A sorted dictionary containing Lambda function information with function names
+            as keys and their respective details as values.
+    Note:
+      This function makes API calls to AWS Lambda service and processes results in batches
+      to handle potential pagination in the AWS response.
+    """
+    logger.info(" ********** Validation results for %s Lambdas ************", app_env)
+    env_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=env_dir, type="ansible", app_env=app_env)
+
+    lambda_client = boto3.client('lambda')
+    next_marker = ""
+    image_dict = {}
+    if proj_list is None:
+      proj_list=[]
+
+    while True:
+      if len(next_marker) != 0:
+        functions_rsp = lambda_client.list_functions(Marker=next_marker)
+      else:
+        functions_rsp = lambda_client.list_functions()
+
+      CommonUtil.get_lambda_versions(client=lambda_client,
+                                    functions_list=functions_rsp['Functions'],
+                                    image_dict=image_dict,
+                                    app_env=app_env,proj_list=proj_list,settings=settings)
+      if 'NextMarker' not in functions_rsp:
+        break
+      next_marker = functions_rsp['NextMarker']
+
+    return OrderedDict(sorted(image_dict.items()))
+ def get_lambda_versions(client=boto3.client('lambda',os.environ.get('AWS_REGION')),
+                           functions_list=None, image_dict=None, app_env=None, proj_list=None, settings=None):
+    """
+    Retrieves version information from AWS Lambda functions and validates their configurations.
+    This function iterates through a list of Lambda functions, extracts their configuration and image
+    version information, and validates them against expected values. It also builds a dictionary
+    of image versions for referenced Lambda container images.
+    Args:
+      client (boto3.client): AWS Lambda client to use for API calls. Defaults to a client
+                  configured with the AWS_REGION from environment variables.
+      functions_list (list, optional): List of Lambda function metadata dictionaries. Each dictionary
+                      should contain at least a 'FunctionName' key. Defaults to an
+                      empty list.
+      image_dict (dict, optional): Dictionary to store image name and version mappings.
+                    Will be populated with entries in the format
+                    {"image_name:": "\"image_version\""}. Defaults to an empty dict.
+      app_env (str, optional): Application environment identifier used for filtering functions.
+                  Only functions ending with this environment suffix will be processed.
+      proj_list (list, optional): List of projects for validation. Passed to validate_lambda_version.
+                      Defaults to an empty list.
+      settings (object, optional): Configuration settings used for validation. Passed to
+                    validate_lambda_version.
+    Returns:
+      None: This function doesn't return a value but updates the image_dict parameter with
+          collected image versions.
+    Note:
+      - The function filters Lambda functions to only process those starting with "project-ped"
+        and ending with the specified app_env.
+      - For container images, the function extracts and formats the image tag for validation.
+      - The function calls ValidateUtil.validate_lambda_version to verify Lambda configurations.
+    """
+
+    if functions_list is None:
+      functions_list=[]
+    if image_dict is None:
+      image_dict={}
+    if proj_list is None:
+      proj_list=[]
+
+    for func in functions_list:
+      name = func['FunctionName']
+      env_vars= {}
+      # Skip functions that don't match our naming pattern
+      if not (name.startswith("project-ped") and name.endswith(f"-{app_env}")):
+        return
+
+      func_config_version = "N/A"
+      image_version = "N/A"
+
+      # Get function details
+      resp = client.get_function(FunctionName=name)
+
+      # Extract config version from tags
+      if "Tags" in resp and "CONFIG_VERSION" in resp["Tags"]:
+        func_config_version = resp["Tags"]["CONFIG_VERSION"]
+
+      # Extract environment variables
+      if "Environment" in resp['Configuration'] and "Variables" in resp['Configuration']["Environment"]:
+        env_vars = resp['Configuration']['Environment']['Variables']
+
+      # Process image URI if present
+      if "ImageUri" in resp["Code"]:
+        image_version = ECRUtil.translate_image_tag_type(image_uri=resp['Code']['ImageUri'])
+
+        # Handle case where image_version is a list
+        if isinstance(image_version, list):
+          for image in image_version:
+            if image != "latest":
+              image_version = image
+              break
+
+        # Extract and format image name for dictionary
+        image_name = resp['Code']['ImageUri'].split("/")[-1]
+        image_name = image_name.split(":")[0].split("@")[0]
+        image_name = image_name.replace("-", "_").replace(f"{app_env}_vfmp_", "deployment_version_")
+
+        # Add to image dictionary if not already present
+        if f"{image_name}:" not in image_dict:
+          image_dict[f"{image_name}:"] = f"\"{image_version}\""
+
+      # Validate lambda version with collected data
+      ValidateUtil.validate_lambda_version(name, image_version,
+                                           env_vars, func_config_version, proj_list=proj_list, settings=settings)
+def validate_lambda_version(name,image_version,env_vars,func_config_version,proj_list=None, settings=None):
+    if proj_list is None:
+      proj_list=[]
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=os.environ.get('CODEBUILD_SRC_DIR'),
+                                        type="ansible",
+                                        app_env=os.environ['APP_ENV']
+                                        )
+    for k,v in settings.items():
+      if k.endswith("lambdas_stack") or k.endswith("lambda_stack"):
+        for lambdafunc in v["lambdas"]:
+          if lambdafunc.get("name") == name:
+            deploy_tag = lambdafunc.get("image_tag")
+            if deploy_tag is not None:
+              if deploy_tag == 'latest':
+                logger.debug("get image_version for %s", deploy_tag)
+                deploy_tag=ECRUtil.get_latest_image_tag_version(ecr_repo_name=lambdafunc.get("image_name"))
+
+              if image_version != "N/A" and image_version.split("_")[0] in deploy_tag:
+                ValidateUtil.handle_success(item_type='lambda_image_version',
+                                          item=lambdafunc['name'],
+                                          expected=deploy_tag,
+                                          found=image_version
+                                          )
+                ValidateUtil.lambda_image_versions.append({'Item': lambdafunc['name'],
+                                                           'ECR': lambdafunc.get("image_name"),
+                                                           'found': image_version
+                                                          }
+                                                         )
+                logger.info("Successful lambda_image_versions %s", len(ValidateUtil.lambda_image_versions))
+
+              else:
+                ValidateUtil.handle_error(item_type='lambda_image_version',
+                                        item=lambdafunc['name'],
+                                        expected=deploy_tag,
+                                        found=image_version,
+                                        proj_list=proj_list
+                                        )
+            elif func_config_version != "N/A" and config_version in func_config_version:
+              ValidateUtil.handle_success(item_type='lambda_config_version',
+                                        item=lambdafunc['name'],
+                                        expected=config_version,
+                                        found=func_config_version
+                                        )
+            else:
+              ValidateUtil.handle_error(item_type='lambda_config_version',
+                                      item=lambdafunc['name'],
+                                      expected=config_version,
+                                      found=func_config_version,
+                                      proj_list=proj_list
+                                      )
+
+            if lambdafunc.get("environment") is not None:
+              env_list = lambdafunc.get("environment")
+              for env in env_list:
+                if env.get("name") is not None:
+                  if env["name"] not in env_vars:
+                    logger.error("Environment variable %s doesn't exist for %s", env['name'], lambdafunc['name'])
+                    continue
+                if env.get("value") is not None:
+                  if env["value"] == env_vars[env["name"]]:
+                    ValidateUtil.handle_success(item_type='lambda_environment',
+                                              item=lambdafunc['name'],
+                                              expected=env["value"],
+                                              found=env_vars[env["name"]]
+                                              )
+                  else:
+                    ValidateUtil.handle_error(item_type='lambda_environment',
+                                            item=lambdafunc['name'],
+                                            expected=env["value"],
+                                            found=env_vars[env["name"]],
+                                            proj_list=proj_list
+                                            )
+                elif(env.get("stack_name") is not None and
+                     env.get("pattern") is not None and
+                     env.get("resource_type") is not None):
+                  var_stack_name = env["stack_name"]
+                  # need to strip the the resource arn to only get the resource-type/resource-id
+
+                  # The specific components and values used in the segments of an ARN depend
+                  # on which AWS service the ARN is for. The following example shows how ARNs are constructed.
+                  # arn:partition:service:region:account-id:resource-id
+                  # arn:partition:service:region:account-id:resource-type/resource-id
+                  # arn:partition:service:region:account-id:resource-type:resource-id
+
+                  try:
+                    stack_arn = CloudFormationClient.get_resource_arn(
+                                        stack_name=settings[var_stack_name]["stack_name"],
+                                        pattern=env["pattern"],
+                                        resource_type=env["resource_type"])
+                  except ValidationError as ve:
+                    ValidateUtil.handle_error(item_type='lambda_environment_stack_arn',
+                                            item=lambdafunc['name'],
+                                            expected=settings[var_stack_name]["stack_name"],
+                                            found=ve,
+                                            proj_list=proj_list
+                                            )
+                  except ClientError as ce:
+                    logger.exception(ce.response['Error']['Code'])
+
+                  resource_type_id = stack_arn.split(str(settings['aws_account_id']))[-1].replace(':','',1)
+                  if env_vars.get(env["name"])is not None and resource_type_id in env_vars[env["name"]]:
+                    ValidateUtil.handle_success(item_type='lambda_environment_stack_arn',
+                                              item=lambdafunc['name'],
+                                              expected=stack_arn,
+                                              found=env_vars[env["name"]]
+                                              )
+                  else:
+                    found=""
+                    if env_vars.get(env["name"]) is not None:
+                      found=env_vars[env["name"]]
+                    ValidateUtil.handle_error(item_type='lambda_environment_stack_arn',
+                                            item=lambdafunc['name'],
+                                            expected=stack_arn,
+                                            found=found,
+                                            proj_list=proj_list
+                                            )
