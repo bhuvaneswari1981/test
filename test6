@@ -1,5 +1,7 @@
-I’ve generated a diff report comparing the prod and dev branches. The report outlines the files that have been added, modified, or deleted between the two versions.
-
-Please find the attached diff_report.txt for your review.
-
-Let me know if you'd like the changes categorized further or exported in a different format (e.g., CSV or Excel).
+(
+  echo "=== Commit Log ==="
+  git log prod..dev --pretty=format:"%h | %s"
+  echo ""
+  echo "=== File Changes (Status | Path) ==="
+  git diff --name-status prod..dev
+) > /c/bhuvana/prod_dev_diff_full_report.txt
