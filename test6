@@ -1,26 +1,28 @@
-278_service_stack:
-  stack_name: "project-ped-{{ app_env }}-278-ecs-service-stack"
-  name: "{{ app_env }}-278-service"
-  image_name: "{{ deployment_source_ecr_278 }}"
-  image_tag: "{{ deployment_version_278 }}"
-  image_source_env: "{{ deployment_source_env_278 }}"
-  cpus: 2048
-  memory_size: 8
-  command: ["dotnet", "PayerEDI.TAS._278Transaction.Server.dll"]
-  load_balancer_name: "{{ alb_name }}"
-  instance_type: "m6i.2xlarge"
-  # Beta and Dev use port 443 in addition to port 9443
-  # Port 443 = no mTLS, Port 9443 = mTLS
-  listener_port: "{{ ports_278 | default([9443]) }}"
-  ecs_container_port: 8080
-  path_conditions: ["/278*", "/fhir.278"]
-  path_priority: 1
-  # This is the cloudformation output name for the ALB security group
-  peer_sg: "project-ped-{{ app_env }}-alb-sg"
-  role_arn: "{{ iam_arn }}:role/project/{{ project_ped_batch_service_role }}"
-  asg_role_arn: "{{ iam_arn }}:role/project/{{ ec2_asg_role }}"
-  # Minimum number of instances. Desired capacity defaults to this value
-  asg_min_cap: 1
-  # Maximum number of instances
-  asg_max_cap: 10
-  desired_task_count: 1
+[Container] 2025/07/07 16:58:30.631230 Running command export ansible_command="ansible-playbook $CODEBUILD_SRC_DIR/playbooks/$ansible_playbook"
+
+[Container] 2025/07/07 16:58:30.647348 Running command export inventory_file=$CODEBUILD_SRC_DIR/environments/$env_dir/inventory
+
+[Container] 2025/07/07 16:58:30.663800 Running command export ANSIBLE_HOST_KEY_CHECKING=False
+
+[Container] 2025/07/07 16:58:30.680117 Running command export extra_args="var_hosts=$HOST aws_config_path=/tmp/config"
+
+[Container] 2025/07/07 16:58:30.696368 Running command if [[ -n "$ANSIBLE_DEBUG" ]]; then
+  echo "ANSIBLE_DEBUG found"
+  if [[ "$ANSIBLE_DEBUG" == vv* ]];then
+    echo "ANSIBLE_DEBUG raised $ANSIBLE_DEBUG"
+    export DEBUG="-$ANSIBLE_DEBUG";
+  else
+    echo "no extra debug defined"
+  fi
+else
+  echo "ANSIBLE_DEBUG not found"
+fi
+
+ANSIBLE_DEBUG found
+no extra debug defined
+
+[Container] 2025/07/07 16:58:30.714232 Running command echo execute $ansible_command -i $inventory_file -e "$extra_args" --vault-password-file=$HOME/.vault_pass $DEBUG
+execute ansible-playbook /codebuild/output/src3477880860/src/github.com/department-of-veterans-affairs/ars-devops/playbooks/deployARSWeb.yml -i /codebuild/output/src3477880860/src/github.com/department-of-veterans-affairs/ars-devops/environments/ARS_DEV/inventory -e var_hosts=webserver aws_config_path=/tmp/config --vault-password-file=/home/jenkins/.vault_pass
+
+[Container] 2025/07/07 16:58:30.730859 Running command $ansible_command -i $inventory_file -e "$extra_args" --vault-password-file=$HOME/.vault_pass $DEBUG
+/codebuild/output/tmp/script.sh: line 4: ansible-playbook: command not found
