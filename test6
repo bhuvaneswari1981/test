@@ -1,44 +1,4 @@
-=== Commit Log ===
-457d25172 | Merge pull request #306 from department-of-veterans-affairs/PEDI-34713_fpps_build
-e6103b034 | PEDI-34368 corrected the base version
-2528020fb | PEDI-34713 update node to 22
-171e0f200 | PEDI-34713 updated the build
-a65910490 | PEDI-34713 updated build to push artifact to build artifact repo
-d5a3b7f09 | PEDI-34713 updated build to push artifact to build artifact repo
-932caeaf7 | Merge pull request #305 from department-of-veterans-affairs/PEDI-34713_fpps_build_update
-68c736a58 | PEDI-34713 prepare the clean artifact package
-773ddbe2d | Merge pull request #304 from department-of-veterans-affairs/PEDI-34362_fpps_web
-463e0ea0e | PEDI-34362 removed prejobs and fix the suffix in tag
-0e124c5b0 | PEDI-34362 removed prejobs and fix the suffix in tag
-681d5b44f | Merge pull request #303 from department-of-veterans-affairs/PEDI-34363-angular19
-54cd98381 | PEDI-34363 sass deprecation fixes
-cee6cbdfa | PEDI-34363 angular 19
-61c80141a | PEDI-34363 angular 18
-ff89fb370 | Merge pull request #302 from department-of-veterans-affairs/PEDI-30701-awaitProcessing
-b007f9b8c | PEDI-30701 fix for awaitingProsessing refresh issue
-946501afd | Merge pull request #301 from department-of-veterans-affairs/PEDI-30802_update_codeql
-40db8cb8e |  PEDI-30802 added github env
-187b26ba9 |  PEDI-30802 added github env
-fc8985402 | Merge branch 'PEDI-30802_update_codeql' of https://github.com/department-of-veterans-affairs/fpps-web into PEDI-30802_update_codeql
-8ba37cfdf |  PEDI-30802 added github env
-5dda9cbe2 | Merge branch 'develop' into PEDI-30802_update_codeql
-e30632d35 | Merge pull request #300 from department-of-veterans-affairs/PEDI-30242-ang17-pdfjs
-eaa60f2df | PEDI-30242 angular upgrade tsconfig json lib es2022
-146df7695 | PEDI-30802 update scans and verification
-b605977c8 | PEDI-30242 angular 17 fixes
-5eefc7682 | PEDI-30242 angular 17
-230eff05d | PEDU-30242 ang 16 remove pdf-viewer ngxfocus unused attachment-view
-109561252 | PEDI-30242 angular 15
-b2707b289 | PEDI-30242 angular 14
-=== File Changes (Status | Path) ===
-M	.github/workflows/build-fpps-web.yml
-M	.github/workflows/codeql-analysis.yml
-M	.github/workflows/verification-template.yml
-M	angular.json
-M	package.json
-M	src/app/app-routing.module.ts
-M	src/app/app.component.scss
-M	src/app/app.component.ts
-M	src/app/app.module.ts
-M	src/app/auth/auth.guard.ts
-M	src/app/auth/auth.service.spec.t
+I need JIRA Ticket numbers and purpose of the change.
+I do not care about the github action refactors, only the source code, as this defines what the testers need to test
+
+
