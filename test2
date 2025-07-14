@@ -1,1 +1,484 @@
+# pylint: disable=redefined-builtin,wrong-import-position,too-many-locals
+import os
+import logging
+
+from aws_cdk import (
+    aws_ec2 as ec2,
+    aws_batch as batch,
+    aws_iam as iam,
+    App
+)
+
+from base.ped_global_config import PEDGlobalConfig
+from base.ped_stack import PEDStack
+from base.ped_stack import PEDNestedStack
+from product.payeredi.ec2.security_group.security_group import PEDSecurityGroup
+from product.payeredi.ec2.vpc.vpc import PEDVPC
+
+logger = logging.getLogger()
+lvl = logging.getLevelName(os.environ.get('CB_LOG_LEVEL', 'INFO'))
+logging.basicConfig(format='%(asctime)s [%(levelname)s]: %(funcName)s - %(message)s')
+logger.setLevel(lvl)
+
+#CDK class for constructing a CloudFormation Stack with necessary Batch Compute environments
+class PEDComputeEnvs(PEDNestedStack if PEDGlobalConfig.nested_stack_mode else PEDStack):
+  """
+  PEDComputeEnvs is a class responsible for setting up AWS Batch compute environments,
+  including both Fargate and EC2 ECS compute environments. It also configures job queues
+  and handles the necessary AWS resources such as VPCs, security groups, and IAM roles.
+
+  Attributes:
+    ped_compute_envs_stack_key (str): Key to access compute environments stack configuration.
+  
+  Methods:
+    __init__(app: App, id: str, ped_config, ped_props, **kwargs):
+      Initializes the PEDComputeEnvs instance, reads the batch jobs configuration,
+      initializes the VPC, and creates the compute environments and job queues.
+    
+    setup_fargate_compute_environment(compute_env, ped_vpc, security_groups):
+      Sets up a Fargate compute environment with the given configuration, VPC, and security groups.
+    
+    setup_ec2ecs_compute_environment(compute_env, compute_envs_stack, ped_vpc, security_groups):
+      Sets up an EC2 ECS compute environment with the given configuration, VPC, and security groups.
+    
+    setup_xray():
+      Adds the X-Ray daemon to the user data for instances.
+    
+    setup_job_queues(queues, batch_compute, compute_env):
+      Sets up job queues for the given compute environment.
+    
+    escape_hatch_fix(name, launch_template, batch_managed_comp, instance_role):
+      Applies escape hatch fixes to replace default instance profiles with custom ones
+      in the launch template and batch compute environments.
+  """
+  ped_compute_envs_stack_key = 'compute_envs_stack'
+  #Constructor
+  def __init__(self, app: App, id: str, ped_config, ped_props, **kwargs) -> None:
+    """
+    Initialize the stack for creating compute environments.
+
+    Args:
+      app (App): The application context.
+      id (str): The unique identifier for the stack.
+      ped_config (dict): Configuration dictionary for PED.
+      ped_props (dict): Properties dictionary for PED.
+      **kwargs: Additional keyword arguments.
+
+    Initializes:
+      - Reads the batch jobs configuration from ped_config.
+      - Initializes the VPC using PEDVPC.
+      - Creates EC2-ECS or Fargate compute environments based on the configuration.
+      - Sets up job queues for the compute environments.
+    """
+    super().__init__(app, id, ped_config, ped_props, **kwargs)
+
+    #Read Batch jobs configuration
+    compute_envs_stack = self.ped_config[self.ped_compute_envs_stack_key]
+    compute_envs = compute_envs_stack['compute_envs']
+
+    # Initialize VPC
+    ped_vpc = PEDVPC(self, compute_envs_stack['vpc_id'], "BatchVpc")
+    ped_vpc.import_subnets(self.ped_config['vpc_app_subnet_grp'])
+
+    # Create EC2-ECS or Fargate Compute Environments
+    for compute_env in compute_envs:
+      name = compute_env['name']
+      logger.info("Starting creation of compute environment %s", name)
+
+      # Set security groups
+      security_groups = []
+      ped_security_group = PEDSecurityGroup(self, name, ped_vpc.vpc)
+      security_groups = [ped_security_group.import_security_group(sg_id, sg_id) for sg_id in compute_env['security_groups']]
+
+      # Setup Fargate Compute Environment
+      if "fargate" in compute_env and compute_env['fargate']:
+        batch_compute = self.setup_fargate_compute_environment(compute_env, ped_vpc, security_groups)
+
+      # Setup EC2 ECS Compute Environment
+      else:
+        batch_compute = self.setup_ec2ecs_compute_environment(compute_env, compute_envs_stack, ped_vpc, security_groups)
+
+      # Setup Job Queues - store compute environments for multi-queue setup
+      if not hasattr(self, 'compute_environments'):
+        self.compute_environments = []
+      
+      self.compute_environments.append({
+        'compute_env': batch_compute,
+        'config': compute_env
+      })
+      
+      # Setup individual job queues for this compute environment
+      self.setup_job_queues(compute_env['job_queues'], batch_compute)
+
+    # After setting up all compute environments, create cross-compute environment job queues
+    if hasattr(self, 'compute_environments') and len(self.compute_environments) > 1:
+      self.setup_multi_compute_job_queues()
+
+  def setup_fargate_compute_environment(self, compute_env, ped_vpc, security_groups):
+    """
+    Sets up a Fargate compute environment for AWS Batch.
+
+    Args:
+      compute_env (dict): A dictionary containing the configuration for the compute environment.
+        Expected keys:
+          - 'name': The name of the compute environment.
+          - 'role_arn': The ARN of the IAM role to be used by the compute environment.
+      ped_vpc (Vpc): An instance of a VPC object containing VPC configuration.
+        Expected attributes:
+          - vpc: The VPC to launch the compute environment in.
+          - vpc_subnets: The subnets within the VPC to use.
+      security_groups (list): A list of security groups to associate with the compute environment.
+
+    Returns:
+      batch.FargateComputeEnvironment: The created Fargate compute environment.
+    """
+    name = compute_env['name']
+
+    return batch.FargateComputeEnvironment(
+      self,
+      id=name + "ComputeId",
+      compute_environment_name=name,
+      vpc=ped_vpc.vpc,
+      vpc_subnets=ped_vpc.vpc_subnets,
+      security_groups=security_groups,
+      service_role=iam.Role.from_role_arn(
+        self,
+        name + "Service_Role",
+        compute_env['role_arn'],
+        add_grants_to_resources=False,
+        mutable=False
+      )
+    )
+
+  def setup_ec2ecs_compute_environment(self, compute_env, compute_envs_stack, ped_vpc, security_groups):
+    """
+    Sets up an EC2 ECS Compute Environment for AWS Batch.
+
+    Args:
+      compute_env (dict): Configuration dictionary for the compute environment.
+        Expected keys:
+          - 'name': Name of the compute environment.
+          - 'instance_ami': AMI ID for the instances.
+          - 'instance_type': Instance type for the compute environment.
+          - 'instance_role_arn': ARN of the instance role.
+          - 'role_arn': ARN of the service role.
+          - 'maxv_cpus': Maximum vCPUs for the compute environment.
+          - 'minv_cpus': Minimum vCPUs for the compute environment.
+          - 'use_spot_instances' (optional): Boolean indicating whether to use spot instances.
+      compute_envs_stack (dict): Stack configuration dictionary.
+        Expected keys:
+          - 'xray_daemon' (optional): Boolean indicating whether to set up X-Ray daemon.
+      ped_vpc (Vpc): VPC configuration object.
+        Expected attributes:
+          - vpc: The VPC object.
+          - vpc_subnets: Subnets within the VPC.
+      security_groups (list): List of security groups to associate with the compute environment.
+
+    Returns:
+      ManagedEc2EcsComputeEnvironment: The configured AWS Batch managed compute environment.
+    """
+    name = compute_env['name']
+
+    # create launch template
+    lt_name = name + "lt"
+
+    # lookup ami to be used in launch
+    ami = ec2.MachineImage.lookup(
+      name=compute_env["instance_ami"],
+      # adding owner helps speed up ami lookup
+      owners=[str(self.ped_config['aws_account_id'])]
+    )
+
+    user_data = None
+    if 'xray_daemon' in compute_envs_stack and compute_envs_stack['xray_daemon']:
+      user_data = self.setup_xray()
+
+    instance_role = iam.Role.from_role_arn(self,
+      f"InstanceComputeRole{compute_env['instance_type']}",
+      compute_env['instance_role_arn'],
+      add_grants_to_resources=False,
+      mutable=False
+    )
+
+    launch_template = ec2.LaunchTemplate(self,
+      id=lt_name + "Id",
+      launch_template_name=lt_name,
+      machine_image=ami,
+      require_imdsv2=True,
+      role=instance_role,
+      user_data=user_data
+    )
+    logger.debug("Launch template id: %s", launch_template.launch_template_id)
+
+    batch_service_role = iam.Role.from_role_arn(
+      self,
+      f"ServiceComputeRole{compute_env['instance_type']}",
+      compute_env['role_arn'],
+      add_grants_to_resources=False,
+      mutable=False
+    )
+
+    use_spot_instances = False
+    if 'use_spot_instances' in compute_env and compute_env['use_spot_instances']:
+      use_spot_instances = True
+
+    #Setup Compute environment properties with multiple instance types for better availability
+    instance_types = []
+    if 'instance_types' in compute_env:
+      # Support multiple instance types for fallback options
+      instance_types = [ec2.InstanceType(inst_type) for inst_type in compute_env['instance_types']]
+    else:
+      # Fallback to single instance type for backward compatibility
+      instance_types = [ec2.InstanceType(compute_env['instance_type'])]
+    
+    # Use DIVERSIFIED allocation strategy for better instance type distribution
+    allocation_strategy = batch.AllocationStrategy.DIVERSIFIED if len(instance_types) > 1 else batch.AllocationStrategy.BEST_FIT_PROGRESSIVE
+    
+    batch_managed_comp =  batch.ManagedEc2EcsComputeEnvironment(
+      self,
+      id=name + "ComputeId",
+      allocation_strategy=allocation_strategy,
+      compute_environment_name=name,
+      instance_role=instance_role,
+      instance_types=instance_types,
+      launch_template=launch_template,
+      maxv_cpus=compute_env['maxv_cpus'],
+      minv_cpus=compute_env['minv_cpus'],
+      security_groups=security_groups,
+      service_role=batch_service_role,
+      spot=use_spot_instances,
+      use_optimal_instance_classes=False,
+      vpc=ped_vpc.vpc,
+      vpc_subnets=ped_vpc.vpc_subnets,
+    )
+
+    self.escape_hatch_fix(name, launch_template, batch_managed_comp, instance_role)
+
+    return batch_managed_comp
+
+  def setup_xray(self):
+    """
+    Sets up the AWS X-Ray daemon on an EC2 instance by adding the necessary commands to the user data.
+
+    This method creates a custom user data script that installs the AWS X-Ray daemon from a specified RPM URL.
+    The user data script is formatted as a multipart MIME message to ensure proper execution on the EC2 instance.
+
+    Steps performed:
+    1. Creates a custom user data wrapper with MIME type 'multipart/mixed'.
+    2. Adds necessary MIME headers and shell script commands to the user data.
+    3. Downloads the AWS X-Ray daemon RPM from the specified URL.
+    4. Installs the downloaded RPM using 'yum'.
+
+    Returns:
+      ec2.UserData: The user data wrapper containing the commands to set up the AWS X-Ray daemon.
+    """
+    logger.info("Adding x-ray daemon to user data")
+
+    # add xray daemon to user data
+    user_data_wrapper = ec2.UserData.custom('Content-Type: multipart/mixed; boundary="==XRAYDAEMON=="')
+    user_data_wrapper.add_commands('MIME-Version: 1.0')
+    user_data_wrapper.add_commands('')
+    user_data_wrapper.add_commands('--==XRAYDAEMON==')
+    user_data_wrapper.add_commands('Content-Type: text/x-shellscript; charset="us-ascii"')
+    user_data_wrapper.add_commands('MIME-Version: 1.0')
+    user_data_wrapper.add_commands('Content-Transfer-Encoding: 7bit')
+    user_data_wrapper.add_commands('')
+    user_data_wrapper.add_commands('#!/bin/bash')
+    user_data_wrapper.add_commands('')
+    rpm_url = 'https://s3.us-east-2.amazonaws.com/aws-xray-assets.us-east-2/xray-daemon/aws-xray-daemon-3.x.rpm'
+    user_data_wrapper.add_commands(f'curl {rpm_url} -o /home/ec2-user/xray.rpm')
+    user_data_wrapper.add_commands('yum install -y /home/ec2-user/xray.rpm')
+    user_data_wrapper.add_commands('--==XRAYDAEMON==--')
+
+    return user_data_wrapper
+
+  def setup_job_queues(self, queues, batch_compute):
+    """
+    Sets up AWS Batch job queues and maps them to the provided compute environments.
+    Enhanced to support priority configuration and better queue management.
+
+    Args:
+      queues (list): A list of dictionaries, where each dictionary contains the configuration for a job queue.
+               Each dictionary should have a 'name' key with the name of the job queue.
+               Optional keys: 'priority' (default: 1), 'description'
+      batch_compute (batch.ComputeEnvironment): The AWS Batch compute environment to be associated with the job queues.
+
+    Returns:
+      None
+    """
+    #Loop through the job queues and map them
+    for job_queue in queues:
+      #Construct Batch job queue
+      queue_name = job_queue['name']
+      queue_priority = job_queue.get('priority', 1)  # Default priority of 1
+      
+      ordered_compute_env = batch.OrderedComputeEnvironment(
+        compute_environment=batch_compute,
+        order=1
+      )
+
+      job_queue_obj = batch.JobQueue(
+        self,
+        id=queue_name + "Id",
+        compute_environments=[ordered_compute_env],
+        job_queue_name=queue_name, 
+        priority=queue_priority
+      )
+
+      self.set_stack_output(
+        self,
+        queue_name,
+        job_queue_obj.job_queue_arn,
+        job_queue.get('description', queue_name)
+      )
+      
+      logger.info("Created job queue: %s with priority: %d", queue_name, queue_priority)
+
+  def setup_multi_compute_job_queues(self):
+    """
+    Creates job queues that span multiple compute environments for improved reliability.
+    This addresses capacity constraints by providing fallback options across different
+    instance types and availability zones.
+    
+    Based on production analysis showing occasional startup delays, this configuration
+    allows jobs to automatically failover to alternative compute environments when
+    primary options have capacity constraints.
+    """
+    logger.info("Setting up multi-compute environment job queues for improved reliability")
+    
+    # Group compute environments by workload characteristics
+    compute_env_groups = self.group_compute_environments_by_workload()
+    
+    for group_name, group_config in compute_env_groups.items():
+      queue_name = f"multi-{group_name}-queue"
+      
+      # Create ordered compute environments with priorities
+      ordered_compute_envs = []
+      for i, comp_env_info in enumerate(group_config['compute_envs']):
+        ordered_compute_env = batch.OrderedComputeEnvironment(
+          compute_environment=comp_env_info['compute_env'],
+          order=i + 1  # Lower numbers have higher priority
+        )
+        ordered_compute_envs.append(ordered_compute_env)
+      
+      # Create job queue with multiple compute environments
+      multi_job_queue = batch.JobQueue(
+        self,
+        id=queue_name + "Id",
+        compute_environments=ordered_compute_envs,
+        job_queue_name=queue_name,
+        priority=group_config['priority']
+      )
+      
+      # Export the queue ARN
+      self.set_stack_output(
+        self,
+        queue_name,
+        multi_job_queue.job_queue_arn,
+        f"Multi-compute job queue for {group_name} workloads"
+      )
+      
+      logger.info("Created multi-compute job queue: %s with %d compute environments", 
+                 queue_name, len(ordered_compute_envs))
+
+  def group_compute_environments_by_workload(self):
+    """
+    Groups compute environments based on workload characteristics for optimal
+    job queue distribution. This method analyzes compute environment configurations
+    to create logical groupings that improve job scheduling efficiency.
+    
+    Returns:
+      dict: Dictionary containing compute environment groups with their configurations.
+    """
+    groups = {
+      'cpu-intensive': {
+        'compute_envs': [],
+        'priority': 100,
+        'description': 'High-CPU workloads like data processing and analysis'
+      },
+      'memory-intensive': {
+        'compute_envs': [],
+        'priority': 90,
+        'description': 'High-memory workloads like large dataset processing'
+      },
+      'general-purpose': {
+        'compute_envs': [],
+        'priority': 80,
+        'description': 'Balanced workloads suitable for various tasks'
+      }
+    }
+    
+    for comp_env_info in self.compute_environments:
+      config = comp_env_info['config']
+      compute_env = comp_env_info['compute_env']
+      
+      # Classify based on instance types and configuration
+      instance_types = config.get('instance_types', [config.get('instance_type', '')])
+      
+      if any('c5' in inst_type or 'c6i' in inst_type for inst_type in instance_types):
+        # CPU-optimized instances
+        groups['cpu-intensive']['compute_envs'].append(comp_env_info)
+      elif any('r5' in inst_type or 'r6i' in inst_type or 'x1' in inst_type for inst_type in instance_types):
+        # Memory-optimized instances
+        groups['memory-intensive']['compute_envs'].append(comp_env_info)
+      else:
+        # General purpose instances (m5, m6i, etc.)
+        groups['general-purpose']['compute_envs'].append(comp_env_info)
+    
+    # Filter out empty groups
+    return {k: v for k, v in groups.items() if v['compute_envs']}
+
+  def escape_hatch_fix(self, name, launch_template, batch_managed_comp, instance_role):
+    """
+    Applies escape hatch fixes to AWS CDK resources to customize instance
+    profiles for launch templates and batch compute environments.
+
+    Args:
+      name (str): The name to be used for the instance profile and logging.
+      launch_template (aws_cdk.aws_ec2.CfnLaunchTemplate): The launch template resource to modify.
+      batch_managed_comp (aws_cdk.aws_batch.CfnComputeEnvironment): The batch compute environment resource to modify.
+      instance_role (aws_cdk.aws_iam.Role): The IAM role to associate with the instance profile.
+
+    This method performs the following actions:
+    1. Creates a custom IAM instance profile with the specified role.
+    2. Removes the default instance profile created by CDK for the launch template.
+    3. Overrides the instance profile ARN in the launch template with the custom instance profile ARN.
+    4. Removes the default instance profile created by CDK for the batch compute environment.
+    5. Overrides the instance role in the batch compute environment with the custom instance profile ARN.
+    """
+    logger.debug("Define instance profile")
+    instance_project_name = f"project-ped-{name}"
+    cfn_instance_profile = iam.CfnInstanceProfile(
+      self,
+      instance_project_name + '_Profile',
+      roles=[instance_role.role_name],
+      instance_profile_name=instance_project_name + '_Profile',
+      path="/project/"
+    )
+
+    # Escape hatch for Launch Template
+    for resource in launch_template.node.children:
+      # Remove instance profile that cdk is trying to create
+      if isinstance(resource, iam.CfnInstanceProfile):
+        logger.debug("Escape hatch to remove default launch template instance profile for %s", name + "_lt")
+        launch_template.node.try_remove_child(resource.node.id)
+
+      # Replace arn instance profile in launch template with the one we want instead of the one cdk is trying to create
+      if isinstance(resource, ec2.CfnLaunchTemplate):
+        logger.debug("Escape hatch for cfnInstanceProfile for launch template")
+        resource.add_property_override("LaunchTemplateData.IamInstanceProfile.Arn", cfn_instance_profile.attr_arn)
+
+    # Escape hatch for Batch Compute Environments
+    for resource in batch_managed_comp.node.children:
+      print(type(resource))
+      # Remove instance profile that cdk is trying to create
+      if isinstance(resource, iam.CfnInstanceProfile):
+        logger.debug("Escape hatch to remove default Compute envs instance profile for %s", name + "_computeenv")
+        batch_managed_comp.node.try_remove_child(resource.node.id)
+
+      # Replace arn instance profile in Compute envs template with
+      # the one we want instead of the one cdk is trying to create
+      if isinstance(resource, batch.CfnComputeEnvironment):
+        logger.debug("Escape hatch for cfnInstanceProfile for Compute envs")
+        resource.add_property_override("ComputeResources.InstanceRole", cfn_instance_profile.attr_arn)
 
