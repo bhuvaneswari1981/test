@@ -1,0 +1,6 @@
+As a DevOps Engineer
+
+I want to update jobs so multiple job queues are used
+
+So that based off the results of below I can determine the best grouping for job queues to utilize the 3 defined job queues we have
+After analyzing the production job queues, identified only four situations in the past month where batch jobs experienced startup delays due to capacity constraints. While these infrequent delays have had minimal operational impact, we can further improve reliability by configuring our batch compute environments to support multiple instance types. This change would provide automatic fallback options when specific instance types have limited availability
