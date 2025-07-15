@@ -1,1 +1,230 @@
+"""
+Utility for interacting with AWS Batch services.
+This module provides a collection of static methods for common AWS Batch operations
+such as retrieving ARNs for job definitions and job queues, handling job definitions,
+and formatting batch job names and commands.
+"""
+from collections import OrderedDict
+import os
+import boto3
+from botocore.exceptions import ClientError
 
+from common.utility.ecr_util import ECRUtil
+from common.utility.validate_util import ValidateUtil
+from common.lambdas.layers.default.custom_logger import logger
+from common.utility.config_util import ConfigUtil
+
+batch_client = boto3.client("batch", os.environ.get('AWS_REGION'))
+
+class BatchUtil():
+  """
+  Utility class for AWS Batch operations.
+  This class provides static methods to interact with AWS Batch services,
+  including retrieving ARNs, handling job definitions, formatting job names,
+  and preparing batch commands.
+  """
+
+  @staticmethod
+  def get_job_definition_arn(name):
+    """
+      Retrieves the ARN for an AWS Batch job definition.
+      Args:
+          name (str): The name of the job definition.
+      Returns:
+          str or None: The ARN of the job definition if found, None otherwise.
+      Raises:
+          Exception: Any unhandled exception that occurs during the API call.
+    """
+    job_definition_arn = None
+    try:
+      response = batch_client.describe_job_definitions(jobDefinitionName=name, status='ACTIVE')
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.debug("found arn %s",response['jobDefinitions'][0]['jobDefinitionArn'])
+        job_definition_arn = response['jobDefinitions'][0]['jobDefinitionArn']
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error ("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return job_definition_arn
+
+  @staticmethod
+  def get_job_queue_arn(name):
+    """
+    Retrieves the ARN for an AWS Batch job queue.
+    Args:
+        name (str): The name of the job queue.
+    Returns:
+        str or None: The ARN of the job queue if found, None otherwise.
+    Raises:
+        Exception: Any unhandled exception that occurs during the API call.
+    """
+    job_queue_arn = None
+    try:
+      response = batch_client.describe_job_queues(jobQueues=[name])
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.debug("Found arn %s",response['jobQueues'][0]['jobQueueArn'])
+        job_queue_arn = response['jobQueues'][0]['jobQueueArn']
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error ("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return job_queue_arn
+
+  @staticmethod
+  def handle_job_definitions(app_env=None, settings=None):
+    """
+    Process AWS Batch job definitions to collect and validate active jobs.
+
+    This function retrieves all job definitions from AWS Batch, filters for active jobs
+    that belong to the specified environment, and validates their image versions.
+
+    Args:
+      app_env (str, optional): The application environment prefix to filter jobs by.
+                   Jobs must start with this prefix to be included.
+
+    Returns:
+      OrderedDict: An ordered dictionary containing job names as keys and their
+            corresponding image versions as values, sorted alphabetically.
+
+    The function:
+    1. Retrieves all job definitions from AWS Batch API, handling pagination
+    2. Filters for active jobs that start with the specified environment prefix
+    3. For each job, keeps only the highest revision number
+    4. Extracts image version information from the container image URI
+    5. Validates job definition versions
+    6. Returns an alphabetically sorted dictionary of job names and versions
+
+    Note:
+    - Uses ECRUtil.translate_image_tag_type to extract image version information
+    - Uses BatchUtil.format_batch_job_name to format job names
+    - Uses ValidateUtil.validate_job_definition_version for validation
+    """
+
+    jobs_version_dict = {}
+    next_token = None
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+
+    logger.info(" ********** Validation results for %s Job Definitions ************", app_env)
+    batch_list = []
+    env_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=env_dir,type="ansible",app_env=app_env)
+
+    while True:
+      if next_token is not None:
+        batch_rsp = boto3.client('batch').describe_job_definitions(nextToken=next_token)
+      else:
+        batch_rsp = boto3.client('batch').describe_job_definitions()
+      batch_job_definitions = batch_rsp['jobDefinitions']
+
+      active_jobs = [x for x in batch_job_definitions if x['status'] == "ACTIVE"]
+      for jobdef in active_jobs:
+        job_name = jobdef['jobDefinitionName']
+        job_revision = jobdef['revision']
+        image_uri = jobdef['containerProperties']["image"]
+
+        if not job_name.startswith(app_env + "-"):
+          continue
+
+        # check if job name has already been added
+        if [x['Name'] for x in batch_list if x['Name']==job_name]:
+          for job in batch_list:
+            if job['Name'] == job_name:
+              # add the job that is the most recent revision. Remove older
+              if job_revision > job['Revision']:
+                job_dict = {'Name': job_name, 'Revision': job_revision, 'ImageUri': image_uri}
+                batch_list.append(job_dict)
+                batch_list.remove(job)
+        else:
+          job_dict = {'Name': job_name, 'Revision': job_revision, 'ImageUri': image_uri}
+          batch_list.append(job_dict)
+
+      if 'nextToken' not in batch_rsp:
+        break
+      next_token = batch_rsp['nextToken']
+
+    for job in batch_list:
+      image_version = ECRUtil.translate_image_tag_type(image_uri=job['ImageUri'])
+      if isinstance(image_version, list):
+        for image in image_version:
+          if image != "latest":
+            image_version = image
+
+        BatchUtil.format_batch_job_name(job_name=job['Name'],
+                                         jobs_version_dict=jobs_version_dict,
+                                         image_version=image_version,
+                                         app_env=app_env)
+        ValidateUtil.validate_job_definition_version(job['Name'],image_version, settings=settings)
+
+    return OrderedDict(sorted(jobs_version_dict.items()))
+
+  @staticmethod
+  def format_batch_job_name(job_name, jobs_version_dict=None, image_version="", app_env=None):
+    """
+    Formats a batch job name by applying a series of string replacements and optionally
+    updates a jobs version dictionary with the formatted name.
+
+    This function modifies the job name by replacing certain patterns and
+    storing a mapping between the formatted job name and an image version in the provided dictionary.
+
+    Args:
+      job_name (str): The original batch job name to be formatted
+      jobs_version_dict (dict, optional): Dictionary to store job name to image version mappings.
+        If None, an empty dictionary is used. Defaults to None.
+      image_version (str, optional): The image version to associate with the job name. Defaults to "".
+      app_env (str, optional): The application environment prefix to replace in the job name. Defaults to None.
+
+    Returns:
+      None: The function modifies the jobs_version_dict in-place and does not return a value.
+
+    Examples:
+      >>> jobs_dict = {}
+      >>> format_batch_job_name("dev_pharmacy_job-name_IngestValidateAck", jobs_dict, "1.2.3", "dev")
+      >>> print(jobs_dict)
+      {'deployment_version_job_name:': '"1.2.3"'}
+    """
+
+    if jobs_version_dict is None:
+      jobs_version_dict = {}
+    job_name = job_name.replace("-", "_")
+    job_name = job_name.replace(f"{app_env}_", "deployment_version_")
+    job_name = job_name.replace("vfmp_", "")
+    job_name = job_name.replace("pharmacy_", "")
+    job_name = job_name.replace("_IngestValidateAck", "")
+    if "_835_" in job_name:
+      job_name = "deployment_version_835"
+    if f"{job_name}:" not in jobs_version_dict:
+      jobs_version_dict[f"{job_name}:"] = f"\"{image_version}\""
+
+  @staticmethod
+  def batch_command_with_dll(batch_job):
+    """
+    Prepares the batch command for execution with a DLL file.
+    If a command exists and a DLL is specified in the batch job, this function:
+    1. Prepends the DLL path to the command list
+    2. Prepends 'dotnet' to the command list to execute the DLL
+    Parameters:
+    ----------
+    batch_job : dict
+      A dictionary containing batch job information including:
+      - 'command': List of command arguments
+      - 'dll': Optional path to a DLL file
+      - 'name': Name of the batch job for logging purposes
+    Returns:
+    -------
+    list
+      The modified command list ready for execution
+    """
+
+    if batch_job['command']:
+      if 'dll' in batch_job:
+        batch_job['command'].insert(0, batch_job['dll'])
+        batch_job['command'].insert(0, 'dotnet')
+    logger.debug("batch job %s command is %s", batch_job['name'], batch_job['command'])
+    return batch_job['command']
