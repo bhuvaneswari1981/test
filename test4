@@ -1,1 +1,153 @@
+"""
+Utility for interacting with AWS Batch services.
+This module provides a collection of static methods for common AWS Batch operations
+such as retrieving ARNs for job definitions and job queues, handling job definitions,
+and formatting batch job names and commands.
+"""
+from collections import OrderedDict
+import os
+import boto3
+from botocore.exceptions import ClientError
 
+from common.utility.ecr_util import ECRUtil
+from common.utility.validate_util import ValidateUtil
+from common.lambdas.layers.default.custom_logger import logger
+from common.utility.config_util import ConfigUtil
+
+batch_client = boto3.client("batch", os.environ.get('AWS_REGION'))
+
+class BatchUtil():
+  """
+  Utility class for AWS Batch operations.
+  This class provides static methods to interact with AWS Batch services,
+  including retrieving ARNs, handling job definitions, formatting job names,
+  and preparing batch commands.
+  """
+
+  @staticmethod
+  def get_job_definition_arn(name):
+    """
+      Retrieves the ARN for an AWS Batch job definition.
+      Args:
+          name (str): The name of the job definition.
+      Returns:
+          str or None: The ARN of the job definition if found, None otherwise.
+      Raises:
+          Exception: Any unhandled exception that occurs during the API call.
+    """
+    job_definition_arn = None
+    try:
+      response = batch_client.describe_job_definitions(jobDefinitionName=name, status='ACTIVE')
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.debug("found arn %s",response['jobDefinitions'][0]['jobDefinitionArn'])
+        job_definition_arn = response['jobDefinitions'][0]['jobDefinitionArn']
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error ("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return job_definition_arn
+
+  @staticmethod
+  def get_job_queue_arn(name):
+    """
+    Retrieves the ARN for an AWS Batch job queue.
+    Args:
+        name (str): The name of the job queue.
+    Returns:
+        str or None: The ARN of the job queue if found, None otherwise.
+    Raises:
+        Exception: Any unhandled exception that occurs during the API call.
+    """
+    job_queue_arn = None
+    try:
+      response = batch_client.describe_job_queues(jobQueues=[name])
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.debug("Found arn %s",response['jobQueues'][0]['jobQueueArn'])
+        job_queue_arn = response['jobQueues'][0]['jobQueueArn']
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error ("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return job_queue_arn
+
+  @staticmethod
+  def get_available_job_queues(app_env=None, compute_env_type=None):
+    """
+    Retrieves all available job queues for a given environment and optionally filters by compute environment type.
+    
+    Args:
+        app_env (str, optional): The application environment to filter by.
+        compute_env_type (str, optional): The compute environment type to filter by (e.g., 'memory', 'cpu', 'general', 'fargate').
+    
+    Returns:
+        list: A list of dictionaries containing job queue information with keys:
+              - 'name': Job queue name
+              - 'arn': Job queue ARN
+              - 'priority': Job queue priority
+              - 'state': Job queue state
+              - 'compute_env_type': Inferred compute environment type
+    """
+    job_queues = []
+    if app_env is None:
+      app_env = os.environ.get('APP_ENV', '')
+    
+    try:
+      response = batch_client.describe_job_queues()
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        for queue in response['jobQueues']:
+          queue_name = queue['jobQueueName']
+          
+          # Filter by app environment if specified
+          if app_env and not queue_name.startswith(app_env):
+            continue
+          
+          # Infer compute environment type from queue name
+          inferred_type = None
+          if '_memory' in queue_name:
+            inferred_type = 'memory'
+          elif '_cpu' in queue_name:
+            inferred_type = 'cpu'
+          elif '_general' in queue_name:
+            inferred_type = 'general'
+          elif '_fargate' in queue_name:
+            inferred_type = 'fargate'
+          
+          # Filter by compute environment type if specified
+          if compute_env_type and inferred_type != compute_env_type:
+            continue
+          
+          job_queue_info = {
+            'name': queue_name,
+            'arn': queue['jobQueueArn'],
+            'priority': queue.get('priority', 1),
+            'state': queue.get('state', 'UNKNOWN'),
+            'compute_env_type': inferred_type
+          }
+          job_queues.append(job_queue_info)
+          
+    except ClientError as ce:
+      logger.error("ClientError Code: %s", ce.response['Error']['Code'])
+      logger.error("ClientError: %s", ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    
+    # Sort by priority (descending) and then by name
+    job_queues.sort(key=lambda x: (-x['priority'], x['name']))
+    return job_queues
+
+  @staticmethod
+  def select_optimal_job_queue(job_requirements=None, app_env=None):
+    """
+    Selects the optimal job queue based on job requirements and current queue availability.
+    
+    Args:
+        job_requirements (dict, optional): Dictionary containing job requirements:
+                                         - 'compute_type': Preferred compute type ('memory', 'cpu', 'general', 'fargate')
+                                         - 'priority': Job priority level ('high', 'medium', 'low')
+                                         - 'vcpus': Required vCPUs
+                                         - '
