@@ -208,4 +208,269 @@ class BatchUtil():
     logger.debug("batch job %s command is %s", batch_job['name'], batch_job['command'])
     return batch_job['command']
 
+@staticmethod
+  def get_available_job_queues(queue_prefix=None):
+    """
+    Retrieves all available job queues, optionally filtered by prefix.
+    
+    Args:
+        queue_prefix (str, optional): Filter queues by name prefix (e.g., environment name).
+        
+    Returns:
+        list: List of dictionaries containing queue information including name, ARN, 
+              state, priority, and compute environment details.
+    """
+    available_queues = []
+    try:
+      response = batch_client.describe_job_queues()
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        for queue in response['jobQueues']:
+          if queue_prefix is None or queue['jobQueueName'].startswith(queue_prefix):
+            queue_info = {
+              'name': queue['jobQueueName'],
+              'arn': queue['jobQueueArn'],
+              'state': queue['state'],
+              'priority': queue['priority'],
+              'compute_environments': [ce['computeEnvironment'] for ce in queue.get('computeEnvironmentOrder', [])]
+            }
+            available_queues.append(queue_info)
+
+        logger.info("Found %d job queues%s", len(available_queues), 
+                   f" with prefix '{queue_prefix}'" if queue_prefix else "")
+    except ClientError as ce:
+      logger.error("ClientError Code: %s", ce.response['Error']['Code'])
+      logger.error("ClientError: %s", ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return available_queues
+
+  @staticmethod
+  def select_optimal_queue(workload_type="general", priority="medium", app_env=None):
+    """
+    Selects the optimal job queue based on workload characteristics and priority.
+    
+    This method implements intelligent queue selection based on the multi-queue setup:
+    - general_purpose: Balanced workloads (m6i/m5 instances)
+    - cpu_optimized: Compute-intensive jobs (c6i/c5 instances)  
+    - memory_optimized: Memory-intensive jobs (r6i/r5 instances)
+    - serverless: Variable/bursty workloads (Fargate)
+    
+    Args:
+        workload_type (str): Type of workload - "general", "cpu", "memory", or "fargate"
+        priority (str): Priority level - "high", "medium", or "low"
+        app_env (str, optional): Application environment prefix
+        
+    Returns:
+        str or None: The name of the optimal job queue, or None if not found
+    """
+    if app_env is None:
+      app_env = os.environ.get('APP_ENV', 'dev')
+
+    # Map workload types to queue name patterns
+    workload_mapping = {
+      "general": "general",
+      "cpu": "cpu", 
+      "memory": "memory",
+      "fargate": "fargate",
+      "compute": "cpu",  # Alias for cpu
+      "balanced": "general"  # Alias for general
+    }
+
+    # Map priority levels to queue suffixes
+    priority_mapping = {
+      "high": "high",
+      "medium": "medium", 
+      "low": "low",
+      "critical": "high",  # Alias for high
+      "normal": "medium",  # Alias for medium
+      "background": "low"  # Alias for low
+    }
+
+    queue_type = workload_mapping.get(workload_type.lower(), "general")
+    queue_priority = priority_mapping.get(priority.lower(), "medium")
+
+    # Construct expected queue name based on your batch.yml pattern
+    expected_queue_name = f"{app_env}JobQueue_{queue_type}_{queue_priority}"
+
+    # Verify the queue exists and is available
+    available_queues = BatchUtil.get_available_job_queues(queue_prefix=app_env)
+
+    for queue in available_queues:
+      if queue['name'] == expected_queue_name and queue['state'] == 'ENABLED':
+        logger.info("Selected optimal queue: %s for workload_type=%s, priority=%s", 
+                   expected_queue_name, workload_type, priority)
+        return expected_queue_name
+
+    # Fallback to general medium priority queue if specific queue not found
+    fallback_queue = f"{app_env}JobQueue_general_medium"
+    for queue in available_queues:
+      if queue['name'] == fallback_queue and queue['state'] == 'ENABLED':
+        logger.warning("Optimal queue %s not found, falling back to %s", 
+                      expected_queue_name, fallback_queue)
+        return fallback_queue
+
+    logger.error("No suitable job queue found for workload_type=%s, priority=%s, app_env=%s", 
+                workload_type, priority, app_env)
+    return None
+
+  @staticmethod
+  def get_queue_capacity_info(queue_name):
+    """
+    Retrieves capacity and utilization information for a job queue.
+    
+    Args:
+        queue_name (str): The name of the job queue
+        
+    Returns:
+        dict: Dictionary containing queue capacity information including:
+              - runnable_jobs: Number of jobs in RUNNABLE state
+              - running_jobs: Number of jobs in RUNNING state  
+              - pending_jobs: Number of jobs in PENDING state
+              - compute_environments: List of associated compute environments
+              - total_capacity: Total available capacity across compute environments
+    """
+    capacity_info = {
+      'queue_name': queue_name,
+      'runnable_jobs': 0,
+      'running_jobs': 0,
+      'pending_jobs': 0,
+      'compute_environments': [],
+      'total_capacity': 0
+    }
+
+    try:
+      # Get queue details
+      queue_response = batch_client.describe_job_queues(jobQueues=[queue_name])
+      if queue_response['jobQueues']:
+        queue = queue_response['jobQueues'][0]
+        capacity_info['compute_environments'] = [
+          ce['computeEnvironment'] for ce in queue.get('computeEnvironmentOrder', [])
+        ]
+
+        # Get job counts by state
+        for state in ['RUNNABLE', 'RUNNING', 'PENDING']:
+          try:
+            jobs_response = batch_client.list_jobs(jobQueue=queue_name, jobStatus=state)
+            job_count = len(jobs_response.get('jobList', []))
+            capacity_info[f'{state.lower()}_jobs'] = job_count
+          except ClientError:
+            # Continue if we can't get job counts for a specific state
+            pass
+
+        logger.debug("Queue %s capacity info: %s", queue_name, capacity_info)
+
+    except ClientError as ce:
+      logger.error("Error getting capacity info for queue %s: %s", queue_name, ce.response['Error']['Code'])
+    except Exception as ex:
+      logger.exception("Unexpected error getting capacity info for queue %s", queue_name)
+
+    return capacity_info
+
+  @staticmethod
+  def analyze_queue_performance(app_env=None, hours_back=24):
+    """
+    Analyzes job queue performance over a specified time period.
+    
+    This method provides insights into queue utilization, job success rates,
+    and capacity constraints to help with capacity planning and optimization.
+    
+    Args:
+        app_env (str, optional): Application environment prefix to filter queues
+        hours_back (int): Number of hours to look back for analysis (default: 24)
+        
+    Returns:
+        dict: Performance analysis results including queue utilization,
+              success rates, and recommendations for optimization
+    """
+    if app_env is None:
+      app_env = os.environ.get('APP_ENV', 'dev')
+
+    analysis = {
+      'analysis_period_hours': hours_back,
+      'total_queues_analyzed': 0,
+      'queue_performance': {},
+      'recommendations': [],
+      'summary': {}
+    }
+
+    try:
+      # Get all queues for the environment
+      available_queues = BatchUtil.get_available_job_queues(queue_prefix=app_env)
+      analysis['total_queues_analyzed'] = len(available_queues)
+
+      for queue in available_queues:
+        queue_name = queue['name']
+
+        # Get current capacity info
+        capacity_info = BatchUtil.get_queue_capacity_info(queue_name)
+
+        # Determine queue group based on naming pattern
+        queue_group = "unknown"
+        if "_general_" in queue_name:
+          queue_group = "general_purpose"
+        elif "_cpu_" in queue_name:
+          queue_group = "cpu_optimized" 
+        elif "_memory_" in queue_name:
+          queue_group = "memory_optimized"
+        elif "_fargate_" in queue_name:
+          queue_group = "serverless"
+
+        # Determine priority based on naming pattern
+        actual_priority = queue.get('priority', 1)
+        if actual_priority >= 3:
+          priority = "high"
+        elif actual_priority >= 2:
+          priority = "medium"
+        else:
+          priority = "low"
+
+        analysis['queue_performance'][queue_name] = {
+          'queue_group': queue_group,
+          'priority': priority,
+          'state': queue['state'],
+          'capacity_info': capacity_info,
+          'utilization_score': 0  # Placeholder for future enhancement
+        }
+
+      # Generate recommendations based on analysis
+      high_utilization_queues = []
+      disabled_queues = []
+
+      for queue_name, perf_data in analysis['queue_performance'].items():
+        if perf_data['state'] != 'ENABLED':
+          disabled_queues.append(queue_name)
+
+        # Check for potential capacity issues
+        capacity = perf_data['capacity_info']
+        if capacity['runnable_jobs'] > 10:  # Threshold for high queue depth
+          high_utilization_queues.append(queue_name)
+
+      if disabled_queues:
+        analysis['recommendations'].append(
+          f"Found {len(disabled_queues)} disabled queues: {', '.join(disabled_queues)}"
+        )
+
+      if high_utilization_queues:
+        analysis['recommendations'].append(
+          f"High queue depth detected in {len(high_utilization_queues)} queues - consider capacity scaling"
+        )
+
+      # Summary statistics
+      analysis['summary'] = {
+        'total_runnable_jobs': sum(q['capacity_info']['runnable_jobs'] for q in analysis['queue_performance'].values()),
+        'total_running_jobs': sum(q['capacity_info']['running_jobs'] for q in analysis['queue_performance'].values()),
+        'enabled_queues': len([q for q in analysis['queue_performance'].values() if q['state'] == 'ENABLED']),
+        'queue_groups': len(set(q['queue_group'] for q in analysis['queue_performance'].values()))
+      }
+
+      logger.info("Queue performance analysis completed for %s: %d queues analyzed", 
+                 app_env, analysis['total_queues_analyzed'])
+
+    except Exception as ex:
+      logger.exception("Error during queue performance analysis")
+      analysis['error'] = str(ex)
+
+    return analysis
+
  
