@@ -1,1 +1,621 @@
+batch_util.py
+"""
+Utility for interacting with AWS Batch services.
+This module provides a collection of static methods for common AWS Batch operations
+such as retrieving ARNs for job definitions and job queues, handling job definitions,
+and formatting batch job names and commands.
+"""
+from collections import OrderedDict
+import os
+import boto3
+from botocore.exceptions import ClientError
+
+from common.utility.ecr_util import ECRUtil
+from common.utility.validate_util import ValidateUtil
+from common.lambdas.layers.default.custom_logger import logger
+from common.utility.config_util import ConfigUtil
+
+batch_client = boto3.client("batch", os.environ.get('AWS_REGION'))
+
+class BatchUtil():
+  """
+  Utility class for AWS Batch operations.
+  This class provides static methods to interact with AWS Batch services,
+  including retrieving ARNs, handling job definitions, formatting job names,
+  preparing batch commands, and managing multiple job queues for optimal 
+  capacity distribution and workload routing.
+  
+  Multi-Queue Support:
+  The class includes methods for intelligent queue selection based on workload
+  characteristics (general, CPU-intensive, memory-intensive, serverless) and
+  priority levels (high, medium, low) to optimize job placement across the
+  4 queue groups and 12 total queues.
+  """
+
+  @staticmethod
+  def get_job_definition_arn(name):
+    """
+      Retrieves the ARN for an AWS Batch job definition.
+      Args:
+          name (str): The name of the job definition.
+      Returns:
+          str or None: The ARN of the job definition if found, None otherwise.
+      Raises:
+          Exception: Any unhandled exception that occurs during the API call.
+    """
+    job_definition_arn = None
+    try:
+      response = batch_client.describe_job_definitions(jobDefinitionName=name, status='ACTIVE')
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.debug("found arn %s",response['jobDefinitions'][0]['jobDefinitionArn'])
+        job_definition_arn = response['jobDefinitions'][0]['jobDefinitionArn']
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error ("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return job_definition_arn
+
+  @staticmethod
+  def get_job_queue_arn(name):
+    """
+    Retrieves the ARN for an AWS Batch job queue.
+    Args:
+        name (str): The name of the job queue.
+    Returns:
+        str or None: The ARN of the job queue if found, None otherwise.
+    Raises:
+        Exception: Any unhandled exception that occurs during the API call.
+    """
+    job_queue_arn = None
+    try:
+      response = batch_client.describe_job_queues(jobQueues=[name])
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.debug("Found arn %s",response['jobQueues'][0]['jobQueueArn'])
+        job_queue_arn = response['jobQueues'][0]['jobQueueArn']
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error ("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return job_queue_arn
+
+  @staticmethod
+  def handle_job_definitions(app_env=None, settings=None):
+    """
+    Process AWS Batch job definitions to collect and validate active jobs.
+
+    This function retrieves all job definitions from AWS Batch, filters for active jobs
+    that belong to the specified environment, and validates their image versions.
+
+    Args:
+      app_env (str, optional): The application environment prefix to filter jobs by.
+                   Jobs must start with this prefix to be included.
+
+    Returns:
+      OrderedDict: An ordered dictionary containing job names as keys and their
+            corresponding image versions as values, sorted alphabetically.
+
+    The function:
+    1. Retrieves all job definitions from AWS Batch API, handling pagination
+    2. Filters for active jobs that start with the specified environment prefix
+    3. For each job, keeps only the highest revision number
+    4. Extracts image version information from the container image URI
+    5. Validates job definition versions
+    6. Returns an alphabetically sorted dictionary of job names and versions
+
+    Note:
+    - Uses ECRUtil.translate_image_tag_type to extract image version information
+    - Uses BatchUtil.format_batch_job_name to format job names
+    - Uses ValidateUtil.validate_job_definition_version for validation
+    """
+
+    jobs_version_dict = {}
+    next_token = None
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+
+    logger.info(" ********** Validation results for %s Job Definitions ************", app_env)
+    batch_list = []
+    env_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=env_dir,type="ansible",app_env=app_env)
+
+    while True:
+      if next_token is not None:
+        batch_rsp = boto3.client('batch').describe_job_definitions(nextToken=next_token)
+      else:
+        batch_rsp = boto3.client('batch').describe_job_definitions()
+      batch_job_definitions = batch_rsp['jobDefinitions']
+
+      active_jobs = [x for x in batch_job_definitions if x['status'] == "ACTIVE"]
+      for jobdef in active_jobs:
+        job_name = jobdef['jobDefinitionName']
+        job_revision = jobdef['revision']
+        image_uri = jobdef['containerProperties']["image"]
+
+        if not job_name.startswith(app_env + "-"):
+          continue
+
+        # check if job name has already been added
+        if [x['Name'] for x in batch_list if x['Name']==job_name]:
+          for job in batch_list:
+            if job['Name'] == job_name:
+              # add the job that is the most recent revision. Remove older
+              if job_revision > job['Revision']:
+                job_dict = {'Name': job_name, 'Revision': job_revision, 'ImageUri': image_uri}
+                batch_list.append(job_dict)
+                batch_list.remove(job)
+        else:
+          job_dict = {'Name': job_name, 'Revision': job_revision, 'ImageUri': image_uri}
+          batch_list.append(job_dict)
+
+      if 'nextToken' not in batch_rsp:
+        break
+      next_token = batch_rsp['nextToken']
+
+    for job in batch_list:
+      image_version = ECRUtil.translate_image_tag_type(image_uri=job['ImageUri'])
+      if isinstance(image_version, list):
+        for image in image_version:
+          if image != "latest":
+            image_version = image
+
+        BatchUtil.format_batch_job_name(job_name=job['Name'],
+                                         jobs_version_dict=jobs_version_dict,
+                                         image_version=image_version,
+                                         app_env=app_env)
+        ValidateUtil.validate_job_definition_version(job['Name'],image_version, settings=settings)
+
+    return OrderedDict(sorted(jobs_version_dict.items()))
+
+  @staticmethod
+  def format_batch_job_name(job_name, jobs_version_dict=None, image_version="", app_env=None):
+    """
+    Formats a batch job name by applying a series of string replacements and optionally
+    updates a jobs version dictionary with the formatted name.
+
+    This function modifies the job name by replacing certain patterns and
+    storing a mapping between the formatted job name and an image version in the provided dictionary.
+
+    Args:
+      job_name (str): The original batch job name to be formatted
+      jobs_version_dict (dict, optional): Dictionary to store job name to image version mappings.
+        If None, an empty dictionary is used. Defaults to None.
+      image_version (str, optional): The image version to associate with the job name. Defaults to "".
+      app_env (str, optional): The application environment prefix to replace in the job name. Defaults to None.
+
+    Returns:
+      None: The function modifies the jobs_version_dict in-place and does not return a value.
+
+    Examples:
+      >>> jobs_dict = {}
+      >>> format_batch_job_name("dev_pharmacy_job-name_IngestValidateAck", jobs_dict, "1.2.3", "dev")
+      >>> print(jobs_dict)
+      {'deployment_version_job_name:': '"1.2.3"'}
+    """
+
+    if jobs_version_dict is None:
+      jobs_version_dict = {}
+    job_name = job_name.replace("-", "_")
+    job_name = job_name.replace(f"{app_env}_", "deployment_version_")
+    job_name = job_name.replace("vfmp_", "")
+    job_name = job_name.replace("pharmacy_", "")
+    job_name = job_name.replace("_IngestValidateAck", "")
+    if "_835_" in job_name:
+      job_name = "deployment_version_835"
+    if f"{job_name}:" not in jobs_version_dict:
+      jobs_version_dict[f"{job_name}:"] = f"\"{image_version}\""
+
+  @staticmethod
+  def batch_command_with_dll(batch_job):
+    """
+    Prepares the batch command for execution with a DLL file.
+    If a command exists and a DLL is specified in the batch job, this function:
+    1. Prepends the DLL path to the command list
+    2. Prepends 'dotnet' to the command list to execute the DLL
+    Parameters:
+    ----------
+    batch_job : dict
+      A dictionary containing batch job information including:
+      - 'command': List of command arguments
+      - 'dll': Optional path to a DLL file
+      - 'name': Name of the batch job for logging purposes
+    Returns:
+    -------
+    list
+      The modified command list ready for execution
+    """
+
+    if batch_job['command']:
+      if 'dll' in batch_job:
+        batch_job['command'].insert(0, batch_job['dll'])
+        batch_job['command'].insert(0, 'dotnet')
+    logger.debug("batch job %s command is %s", batch_job['name'], batch_job['command'])
+    return batch_job['command']
+
+  @staticmethod
+  def get_available_job_queues(queue_prefix=None):
+    """
+    Retrieves all available job queues, optionally filtered by prefix.
+    
+    Args:
+        queue_prefix (str, optional): Filter queues by name prefix (e.g., environment name).
+        
+    Returns:
+        list: List of dictionaries containing queue information including name, ARN, 
+              state, priority, and compute environment details.
+    """
+    available_queues = []
+    try:
+      response = batch_client.describe_job_queues()
+      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        for queue in response['jobQueues']:
+          if queue_prefix is None or queue['jobQueueName'].startswith(queue_prefix):
+            queue_info = {
+              'name': queue['jobQueueName'],
+              'arn': queue['jobQueueArn'],
+              'state': queue['state'],
+              'priority': queue['priority'],
+              'compute_environments': [ce['computeEnvironment'] for ce in queue.get('computeEnvironmentOrder', [])]
+            }
+            available_queues.append(queue_info)
+            
+        logger.info("Found %d job queues%s", len(available_queues), 
+                   f" with prefix '{queue_prefix}'" if queue_prefix else "")
+    except ClientError as ce:
+      logger.error("ClientError Code: %s", ce.response['Error']['Code'])
+      logger.error("ClientError: %s", ce.response)
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+    return available_queues
+
+  @staticmethod
+  def select_optimal_queue(workload_type=None, priority=None, app_env=None, cpus=None, memory_gb=None, fargate=False):
+    """
+    Selects the optimal job queue based on workload characteristics and priority.
+    Can auto-detect workload_type and priority from job specifications.
+    
+    This method implements intelligent queue selection based on the multi-queue setup:
+    - general_purpose: Balanced workloads (m6i/m5 instances)
+    - cpu_optimized: Compute-intensive jobs (c6i/c5 instances)  
+    - memory_optimized: Memory-intensive jobs (r6i/r5 instances)
+    - serverless: Variable/bursty workloads (Fargate)
+    
+    Args:
+        workload_type (str, optional): Type of workload - "general", "cpu", "memory", or "fargate"
+                                     If None, will auto-detect from cpus/memory_gb
+        priority (str, optional): Priority level - "high", "medium", or "low"
+                                 If None, will auto-detect from resource requirements
+        app_env (str, optional): Application environment prefix
+        cpus (int, optional): Number of CPUs for the job (for auto-detection)
+        memory_gb (int, optional): Memory in GB for the job (for auto-detection)
+        fargate (bool, optional): Whether job should use Fargate (overrides auto-detection)
+        
+    Returns:
+        str or None: The name of the optimal job queue, or None if not found
+    """
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+    
+    # Auto-detect workload_type if not provided
+    if workload_type is None:
+      workload_type = BatchUtil._auto_detect_workload_type(cpus, memory_gb, fargate)
+      logger.info("Auto-detected workload_type: %s (cpus=%s, memory_gb=%s, fargate=%s)", 
+                 workload_type, cpus, memory_gb, fargate)
+    
+    # Auto-detect priority if not provided  
+    if priority is None:
+      priority = BatchUtil._auto_detect_priority(cpus, memory_gb)
+      logger.info("Auto-detected priority: %s (cpus=%s, memory_gb=%s)", 
+                 priority, cpus, memory_gb)
+    
+    # Validate inputs
+    if workload_type not in ['general', 'cpu', 'memory', 'fargate']:
+      logger.warning("Invalid workload_type '%s', defaulting to 'general'", workload_type)
+      workload_type = 'general'
+    
+    if priority not in ['high', 'medium', 'low']:
+      logger.warning("Invalid priority '%s', defaulting to 'medium'", priority)
+      priority = 'medium'
+    
+    # Map workload types to queue name patterns
+    workload_mapping = {
+      "general": "general",
+      "cpu": "cpu", 
+      "memory": "memory",
+      "fargate": "fargate",
+      "compute": "cpu",  # Alias for cpu
+      "balanced": "general"  # Alias for general
+    }
+    
+    # Map priority levels to queue suffixes
+    priority_mapping = {
+      "high": "high",
+      "medium": "medium", 
+      "low": "low",
+      "critical": "high",  # Alias for high
+      "normal": "medium",  # Alias for medium
+      "background": "low"  # Alias for low
+    }
+    
+    queue_type = workload_mapping.get(workload_type.lower(), "general")
+    queue_priority = priority_mapping.get(priority.lower(), "medium")
+    
+    # Construct expected queue name based on your batch.yml pattern
+    expected_queue_name = f"{app_env}JobQueue_{queue_type}_{queue_priority}"
+    
+    # Verify the queue exists and is available
+    available_queues = BatchUtil.get_available_job_queues(queue_prefix=app_env)
+    
+    for queue in available_queues:
+      if queue['name'] == expected_queue_name and queue['state'] == 'ENABLED':
+        logger.info("Selected optimal queue: %s for workload_type=%s, priority=%s", 
+                   expected_queue_name, workload_type, priority)
+        return expected_queue_name
+    
+    # Fallback to general medium priority queue if specific queue not found
+    fallback_queue = f"{app_env}JobQueue_general_medium"
+    for queue in available_queues:
+      if queue['name'] == fallback_queue and queue['state'] == 'ENABLED':
+        logger.warning("Optimal queue %s not found, falling back to %s", 
+                      expected_queue_name, fallback_queue)
+        return fallback_queue
+    
+    logger.error("No suitable job queue found for workload_type=%s, priority=%s, app_env=%s", 
+                workload_type, priority, app_env)
+    return None
+
+  @staticmethod
+  def _auto_detect_workload_type(cpus, memory_gb, fargate=False):
+    """
+    Auto-detects workload type based on job resource requirements.
+    
+    Args:
+        cpus (int): Number of CPUs for the job
+        memory_gb (int): Memory in GB for the job  
+        fargate (bool): Whether job should use Fargate
+        
+    Returns:
+        str: Detected workload type - "general", "cpu", "memory", or "fargate"
+    """
+    # If explicitly fargate, use fargate
+    if fargate:
+      return "fargate"
+    
+    # Handle case where memory_gb might be a string or None
+    if memory_gb is None:
+      memory_gb = 0
+    elif isinstance(memory_gb, str):
+      try:
+        memory_gb = int(memory_gb)
+      except (ValueError, TypeError):
+        memory_gb = 0
+    
+    # Handle case where cpus might be None
+    if cpus is None:
+      cpus = 1
+    
+    # Detection logic based on resource patterns:
+    # High memory jobs (32GB+) -> memory-optimized queues
+    if memory_gb >= 32:
+      return "memory"
+    
+    # CPU-intensive jobs (4+ CPUs with moderate memory) -> cpu-optimized queues  
+    elif cpus >= 4 and memory_gb <= 16:
+      return "cpu"
+    
+    # High memory with moderate CPUs (16-31GB) -> memory-optimized queues
+    elif memory_gb >= 16:
+      return "memory"
+    
+    # High CPU count regardless of memory -> cpu-optimized queues
+    elif cpus >= 6:
+      return "cpu"
+    
+    # Default to general purpose for balanced workloads
+    else:
+      return "general"
+
+  @staticmethod 
+  def _auto_detect_priority(cpus, memory_gb):
+    """
+    Auto-detects job priority based on resource requirements.
+    Higher resource jobs typically have higher priority.
+    
+    Args:
+        cpus (int): Number of CPUs for the job
+        memory_gb (int): Memory in GB for the job
+        
+    Returns:
+        str: Detected priority - "high", "medium", or "low"
+    """
+    # Handle case where memory_gb might be a string or None
+    if memory_gb is None:
+      memory_gb = 0
+    elif isinstance(memory_gb, str):
+      try:
+        memory_gb = int(memory_gb)
+      except (ValueError, TypeError):
+        memory_gb = 0
+    
+    # Handle case where cpus might be None
+    if cpus is None:
+      cpus = 1
+    
+    # Priority detection logic:
+    # High resource jobs get high priority
+    if memory_gb >= 32 or cpus >= 6:
+      return "high"
+    
+    # Medium resource jobs get medium priority  
+    elif memory_gb >= 16 or cpus >= 4:
+      return "medium"
+    
+    # Low resource jobs get low priority
+    else:
+      return "low"
+
+  @staticmethod
+  def get_queue_capacity_info(queue_name):
+    """
+    Retrieves capacity and utilization information for a job queue.
+    
+    Args:
+        queue_name (str): The name of the job queue
+        
+    Returns:
+        dict: Dictionary containing queue capacity information including:
+              - runnable_jobs: Number of jobs in RUNNABLE state
+              - running_jobs: Number of jobs in RUNNING state  
+              - pending_jobs: Number of jobs in PENDING state
+              - compute_environments: List of associated compute environments
+              - total_capacity: Total available capacity across compute environments
+    """
+    capacity_info = {
+      'queue_name': queue_name,
+      'runnable_jobs': 0,
+      'running_jobs': 0,
+      'pending_jobs': 0,
+      'compute_environments': [],
+      'total_capacity': 0
+    }
+    
+    try:
+      # Get queue details
+      queue_response = batch_client.describe_job_queues(jobQueues=[queue_name])
+      if queue_response['jobQueues']:
+        queue = queue_response['jobQueues'][0]
+        capacity_info['compute_environments'] = [
+          ce['computeEnvironment'] for ce in queue.get('computeEnvironmentOrder', [])
+        ]
+        
+        # Get job counts by state
+        for state in ['RUNNABLE', 'RUNNING', 'PENDING']:
+          try:
+            jobs_response = batch_client.list_jobs(jobQueue=queue_name, jobStatus=state)
+            job_count = len(jobs_response.get('jobList', []))
+            capacity_info[f'{state.lower()}_jobs'] = job_count
+          except ClientError:
+            # Continue if we can't get job counts for a specific state
+            pass
+        
+        logger.debug("Queue %s capacity info: %s", queue_name, capacity_info)
+        
+    except ClientError as ce:
+      logger.error("Error getting capacity info for queue %s: %s", queue_name, ce.response['Error']['Code'])
+    except Exception as ex:
+      logger.exception("Unexpected error getting capacity info for queue %s", queue_name)
+      
+    return capacity_info
+
+  @staticmethod
+  def analyze_queue_performance(app_env=None, hours_back=24):
+    """
+    Analyzes job queue performance over a specified time period.
+    
+    This method provides insights into queue utilization, job success rates,
+    and capacity constraints to help with capacity planning and optimization.
+    
+    Args:
+        app_env (str, optional): Application environment prefix to filter queues
+        hours_back (int): Number of hours to look back for analysis (default: 24)
+        
+    Returns:
+        dict: Performance analysis results including queue utilization,
+              success rates, and recommendations for optimization
+    """
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+    
+    analysis = {
+      'analysis_period_hours': hours_back,
+      'total_queues_analyzed': 0,
+      'queue_performance': {},
+      'recommendations': [],
+      'summary': {}
+    }
+    
+    try:
+      # Get all queues for the environment
+      available_queues = BatchUtil.get_available_job_queues(queue_prefix=app_env)
+      analysis['total_queues_analyzed'] = len(available_queues)
+      
+      for queue in available_queues:
+        queue_name = queue['name']
+        
+        # Get current capacity info
+        capacity_info = BatchUtil.get_queue_capacity_info(queue_name)
+        
+        # Determine queue group based on naming pattern
+        queue_group = "unknown"
+        if "_general_" in queue_name:
+          queue_group = "general_purpose"
+        elif "_cpu_" in queue_name:
+          queue_group = "cpu_optimized" 
+        elif "_memory_" in queue_name:
+          queue_group = "memory_optimized"
+        elif "_fargate_" in queue_name:
+          queue_group = "serverless"
+        
+        # Determine priority based on naming pattern
+        actual_priority = queue.get('priority', 1)
+        if actual_priority >= 3:
+          priority = "high"
+        elif actual_priority >= 2:
+          priority = "medium"
+        else:
+          priority = "low"
+        
+        analysis['queue_performance'][queue_name] = {
+          'queue_group': queue_group,
+          'priority': priority,
+          'state': queue['state'],
+          'capacity_info': capacity_info,
+          'utilization_score': 0  # Placeholder for future enhancement
+        }
+      
+      # Generate recommendations based on analysis
+      high_utilization_queues = []
+      disabled_queues = []
+      
+      for queue_name, perf_data in analysis['queue_performance'].items():
+        if perf_data['state'] != 'ENABLED':
+          disabled_queues.append(queue_name)
+        
+        # Check for potential capacity issues
+        capacity = perf_data['capacity_info']
+        if capacity['runnable_jobs'] > 10:  # Threshold for high queue depth
+          high_utilization_queues.append(queue_name)
+      
+      if disabled_queues:
+        analysis['recommendations'].append(
+          f"Found {len(disabled_queues)} disabled queues: {', '.join(disabled_queues)}"
+        )
+      
+      if high_utilization_queues:
+        analysis['recommendations'].append(
+          f"High queue depth detected in {len(high_utilization_queues)} queues - consider capacity scaling"
+        )
+      
+      # Summary statistics
+      analysis['summary'] = {
+        'total_runnable_jobs': sum(q['capacity_info']['runnable_jobs'] for q in analysis['queue_performance'].values()),
+        'total_running_jobs': sum(q['capacity_info']['running_jobs'] for q in analysis['queue_performance'].values()),
+        'enabled_queues': len([q for q in analysis['queue_performance'].values() if q['state'] == 'ENABLED']),
+        'queue_groups': len(set(q['queue_group'] for q in analysis['queue_performance'].values()))
+      }
+      
+      logger.info("Queue performance analysis completed for %s: %d queues analyzed", 
+                 app_env, analysis['total_queues_analyzed'])
+      
+    except Exception as ex:
+      logger.exception("Error during queue performance analysis")
+      analysis['error'] = str(ex)
+    
+    return analysis
 
