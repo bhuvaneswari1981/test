@@ -1,1 +1,338 @@
+stepfunction(stack.py)
+import os
+import logging
+import string
+
+from aws_cdk import (
+    aws_stepfunctions as sfn,
+    aws_stepfunctions_tasks as sfn_tasks,
+    aws_sns as sns,
+    aws_iam as iam,
+    aws_lambda as lambda_,
+    aws_logs as logs,
+    aws_events as events,
+    aws_events_targets as targets,
+    App,
+    Duration,
+    Tags,
+    RemovalPolicy
+)
+
+from common.utility.stack_util import StackUtil
+from common.utility.config_util import ConfigUtil
+from common.utility.common_util import CommonUtil
+from common.cloudformation.client import CloudFormationClient
+from base.ped_global_config import PEDGlobalConfig
+from base.ped_stack import PEDStack
+from base.ped_stack import PEDNestedStack
+
+logger = logging.getLogger('task_logger')
+lvl = logging.getLevelName(os.environ.get('CB_LOG_LEVEL', 'INFO'))
+logging.basicConfig(format='%(asctime)s [%(levelname)s]: %(funcName)s - %(message)s')
+logger.setLevel(lvl)
+
+
+#CDK class for constructing a CloudFormation Stack with necessary Stepfunctions statemachine
+class PEDJobWrapperStepFunctions(PEDNestedStack if PEDGlobalConfig.nested_stack_mode else PEDStack):
+
+  def __init__(self, app: App, id: str, ped_config, ped_props, **kwargs) -> None:
+    super().__init__(app, id, ped_config, ped_props, **kwargs)
+    self.event_bus = events.EventBus.from_event_bus_name(self, "DefaultEventBus", "default")
+    if 'env_event_bus_name' in self.ped_config:
+      self.event_bus = events.EventBus.from_event_bus_name(self, "EnvEventBus", self.ped_config['env_event_bus_name'])
+
+    sfn_stack = self.ped_config[self.ped_props.stack_arg]
+    comp_envs_stack_name = self.ped_config[sfn_stack['comp_envs_stack']]['stack_name']
+    step_flows = sfn_stack['stepfunctions']
+
+    for flow in step_flows:
+      batch_stack_name = self.ped_config[flow['batch_stack']]['stack_name']
+      sfn_role_arn = flow['role_arn']
+      sfn_name = flow['name']
+      topic_arn= f"{self.ped_config['sns_arn']}:{flow['sns_topic']}"
+      wrapper_job_name = f"{sfn_name}-job"
+
+      # convert sfn name to readable format
+      readable_name = sfn_name.replace(self.ped_props.app_env, "")
+      readable_name = string.capwords(readable_name.replace("-", " "))
+
+      job_queue_type = ''
+      if 'job_queue_type' in flow:
+        job_queue_type = flow['job_queue_type']
+
+      if 'ready_for_promote' in flow:
+        if not CommonUtil.is_target_ready(promote_ready=flow['ready_for_promote'], target_env=self.ped_props.app_env):
+          logger.info("Cannot promote, %s may not be ready to promote, please check config.", sfn_name )
+          continue
+
+      list_running_executions = sfn_tasks.CallAwsService(self,
+                                            f"List Running Executions - {readable_name}",
+                                            service="sfn",
+                                            action="listExecutions",
+                                            parameters={
+                                              "StateMachineArn.$": "$$.StateMachine.Id",
+                                              "StatusFilter": "RUNNING"
+                                            },
+                                            result_selector={
+                                              "runningExecutionsCount.$": "States.ArrayLength($.Executions)"
+                                            },
+                                            iam_resources=["*"]
+                                        )
+
+      success_state = sfn.Pass(self,
+                                f"Pass State - {readable_name}",
+                                comment=f"Processing completed for {sfn_name}"
+                              )
+
+      failure_publish_message = sfn_tasks.SnsPublish(self,
+                                          f"Failed message - {readable_name}",
+                                          topic=sns.Topic.from_topic_arn(self,
+                                                                      f"{wrapper_job_name}_get_topic",
+                                                                      topic_arn
+                                                                      ),
+                                          message=sfn.TaskInput.from_text(f"ERROR: {sfn_name} failed"),
+                                          comment=f"Publish message for {sfn_name}"
+                                        )
+      failure_publish_message.next(sfn.Fail(self,
+                                            f"Fail State - {readable_name}",
+                                            comment=f"Error processing {sfn_name}",
+                                            error=f"{sfn_name} returned FAILED",  # Required
+                                            cause=f"{sfn_name} job FAILED"  # Required
+                                            )
+                                  )
+      try:
+        logger.info("Try to get resources for %s", batch_stack_name)
+        wrapper_job_arn = CloudFormationClient.get_resource_arn(stack_name=batch_stack_name,
+                                                                pattern=f"^{self.ped_props.app_env}{flow['batch_resource_pattern']}",
+                                                                resource_type="AWS::Batch::JobDefinition",
+                                                                app=self,
+                                                                app_env=self.ped_props.app_env)
+      except Exception:
+        logger.exception("Unable to determine resources for batch (%s), skip step function setup %s",
+                         batch_stack_name, sfn_name)
+        continue
+
+      try:
+        logger.info("Try to get resources for %s", comp_envs_stack_name)
+        
+        # Auto-select optimal queue based on job characteristics
+        if 'job_queue_type' in flow and flow['job_queue_type']:
+          # Use explicitly specified queue type
+          wrapper_queue_arn = CloudFormationClient.get_resource_arn(stack_name=comp_envs_stack_name,
+                                                                    pattern=f"^{self.ped_props.app_env}JobQueue{flow['job_queue_type']}.*",
+                                                                    resource_type="AWS::Batch::JobQueue",
+                                                                    app=self,
+                                                                    app_env=self.ped_props.app_env)
+        else:
+          # Get job configuration from batch stack to determine optimal queue
+          batch_stack_config = self.ped_config[flow['batch_stack']]
+          workload_type = "general"  # Default
+          priority = "medium"       # Default
+          
+          # Find the job definition that matches this step function
+          if 'jobs' in batch_stack_config:
+            # Use the same pattern logic that matches job definitions
+            import re
+            from common.utility.batch_util import BatchUtil
+            batch_pattern = flow['batch_resource_pattern']
+            
+            for job in batch_stack_config['jobs']:
+              # Convert job name to the pattern format that batch_resource_pattern expects
+              job_pattern_name = job['name'].replace(f"{self.ped_props.app_env}-", "")
+              
+              # Use regex to match the batch_resource_pattern
+              if re.match(batch_pattern, job_pattern_name):
+                # Auto-detect workload_type and priority from job specs
+                cpus = job.get('cpus', 1)
+                memory_gb = int(job.get('memory_size', 8))
+                fargate = job.get('fargate', False)
+                
+                workload_type = BatchUtil._auto_detect_workload_type(cpus, memory_gb, fargate)
+                priority = BatchUtil._auto_detect_priority(cpus, memory_gb)
+                
+                logger.info("Found matching job config using pattern '%s': %s -> auto-detected workload_type=%s, priority=%s (cpus=%s, memory_gb=%s, fargate=%s)", 
+                           batch_pattern, job['name'], workload_type, priority, cpus, memory_gb, fargate)
+                break
+          
+          # Use BatchUtil logic to construct queue name
+          queue_name = f"{self.ped_props.app_env}JobQueue_{workload_type}_{priority}"
+          logger.info("Auto-selected queue: %s for step function: %s", queue_name, sfn_name)
+          
+          wrapper_queue_arn = CloudFormationClient.get_resource_arn(stack_name=comp_envs_stack_name,
+                                                                    pattern=f"^{queue_name}.*",
+                                                                    resource_type="AWS::Batch::JobQueue",
+                                                                    app=self,
+                                                                    app_env=self.ped_props.app_env)
+      except Exception:
+        logger.exception("Unable to determine resources for compute environment (%s), skip step function setup %s",
+                        comp_envs_stack_name, sfn_name)
+        continue
+
+      if 'custom_payload' in flow:
+        wrapper_payload = sfn.TaskInput.from_object(flow['custom_payload'])
+      elif 'event_rule' in flow and 's3_event_trigger' in flow:
+        wrapper_payload = sfn.TaskInput.from_object({ "S3bucket.$": "$.detail.bucket.name",
+                                                  "S3key.$": "$.detail.object.key"
+                                                  })
+      else:
+        wrapper_payload = sfn.TaskInput.from_object({ "S3bucket.$": "$.Parameters.S3bucket",
+                                                  "S3key.$": "$.Parameters.S3key"
+                                                  })
+
+      wrapper_task = sfn_tasks.BatchSubmitJob(self
+                                ,f"Submit Batch Job - {readable_name}"
+                                ,job_name=wrapper_job_name
+                                ,job_definition_arn=wrapper_job_arn
+                                ,job_queue_arn=wrapper_queue_arn
+                                ,payload=wrapper_payload
+                                ,task_timeout=sfn.Timeout.duration(Duration.minutes(int(flow['wait_time'])))
+                                )
+
+      if 'no_payload' in flow:
+        logger.debug("Check flow['no_payload']: %s ", flow['no_payload'])
+        if flow['no_payload'] is True:
+          wrapper_task = sfn_tasks.BatchSubmitJob(self
+                                       ,f"Submit Batch Job no payload - {readable_name}"
+                                       ,job_name=wrapper_job_name
+                                       ,job_definition_arn=wrapper_job_arn
+                                       ,job_queue_arn=wrapper_queue_arn
+                                       ,task_timeout=sfn.Timeout.duration(Duration.minutes(int(flow['wait_time'])))
+                                       )
+
+      wrapper_task.add_catch(failure_publish_message,
+                      errors=["States.TaskFailed", "States.Timeout"],
+                      result_path="$.error"
+                      )
+
+      # this task is dynamic and will either be a wait task or a batch job task
+      dynamic_task = None
+
+      # if true, wait for external batch job to finish before it runs
+      if 'check_batch_running_lambda' in flow and flow['check_batch_running_lambda'] is not None:
+        dynamic_task = sfn.Wait(self, f"Wait - {readable_name}",
+          time=sfn.WaitTime.duration(Duration.seconds(15)))
+
+        # get python lambda stack name
+        python_lambda_stack_name = self.ped_config[flow['python_lambda_stack']]['stack_name']
+
+        logger.info("Try to get resources for %s with pattern %s", python_lambda_stack_name, flow['check_batch_running_lambda'])
+        job_status_lambda_arn, lambda_name = StackUtil.get_lambda_function_arn_and_name(self,
+                                                                                        self.ped_props.app_env,
+                                                                                        python_lambda_stack_name,
+                                                                                        pattern=f"{flow['check_batch_running_lambda']}")
+
+
+        get_batch_job_status_task = sfn_tasks.LambdaInvoke(self,
+                                                    f"Get Batch Job Status - {readable_name}",
+                                                    retry_on_service_exceptions=False,
+                                                    result_path="$.result",
+                                                    lambda_function=lambda_.Function.from_function_arn(self,
+                                                                                                      lambda_name,
+                                                                                                      job_status_lambda_arn
+                                                                                                      )
+        )
+
+        dynamic_task.next(get_batch_job_status_task) \
+          .next(sfn.Choice(self, f"Is Batch job complete - {readable_name}")
+                          .when(sfn.Condition.string_equals("$.result.Payload.batch_job_running", "true"), dynamic_task) \
+                          .otherwise(wrapper_task)) \
+
+      else:
+        dynamic_task = wrapper_task
+        dynamic_task.next(success_state)
+
+      if 'max_executions' in flow:
+        chain = sfn.Chain.start(list_running_executions) \
+                         .next(sfn.Choice(self, f"Check if Process Running - {readable_name}") \
+                            .when(sfn.Condition.number_less_than_equals("$.runningExecutionsCount", flow['max_executions']), dynamic_task) \
+                            .otherwise(success_state))
+      else:
+        chain = sfn.Chain.start(dynamic_task)
+
+      # Log Group Name stack update needs to be ironed out before this is enabled.
+      log_group_name="/aws/vendedlogs/states/" + sfn_name
+      log_group = logs.LogGroup(self,
+                                f"{log_group_name}_{sfn_name}_id",
+                                log_group_name=log_group_name,
+                                removal_policy=RemovalPolicy.DESTROY
+                                )
+
+      sfn_iam_role = iam.Role.from_role_arn(self,
+                                            f"{sfn_name}_sm_role",
+                                            sfn_role_arn,
+                                            add_grants_to_resources=False,
+                                            mutable=False)
+
+      state_machine = sfn.StateMachine(self,
+                                       f"{sfn_name}_state_machine",
+                                       role=sfn_iam_role,
+                                       definition_body=sfn.DefinitionBody.from_chainable(chain),
+                                       logs={
+                                         "destination": log_group,
+                                         "level": sfn.LogLevel.ALL
+                                       },
+                                       state_machine_name=sfn_name,
+                                       timeout=Duration.seconds(int(flow['sfn_timeout']))
+                                      )
+      if 'event_rule' in flow:
+        # Single event rule schedule
+        if 'event_schedule' in flow:
+          rule = events.Rule(self,
+                             f"{flow['event_rule']}_ID",
+                             description=f"Event Rule to trigger {wrapper_job_name}",
+                             rule_name=f"{flow['event_rule']}",
+                             schedule=events.Schedule.expression(flow['event_schedule'])
+                             )
+        # Using eventbridge for an s3 trigger
+        elif 's3_event_trigger' in flow:
+          s3_event_trigger = flow['s3_event_trigger']
+          rule = events.Rule(self,
+                            f"{flow['event_rule']}_ID",
+                            description=f"Event Rule to trigger {wrapper_job_name}",
+                            rule_name=f"{flow['event_rule']}",
+                            event_pattern=events.EventPattern(
+                                source=["aws.s3"],
+                                detail={
+                                  "bucket": { "name": [s3_event_trigger['bucket']] },
+                                  "object": { "key": [{ "prefix": s3_event_trigger['folder'] }] }
+                                },
+                                detail_type=['Object Created']
+                              ),
+                            event_bus=self.event_bus
+                            )
+        else:
+          raise Exception("Event rule set, but event_schedule or s3_event_trigger not configured")
+
+        rule.add_target(targets.SfnStateMachine(
+                                  machine=state_machine,
+                                  role=sfn_iam_role
+                                  )
+                        )
+      # Multiple event rule schedules for one step function. Additionally, inputs can be added
+      elif 'event_rules' in flow:
+        for ev in flow['event_rules']:
+          event_input = None
+          if 'input_actions' in ev:
+            event_input = {}
+            for actions in ev['input_actions']:
+              event_input[actions['name']] = actions['value']
+            logger.info("Input actions: %s", event_input)
+
+          rule = events.Rule(self,
+                          f"{ev['event_rule']}_ID",
+                          description=f"Event Rule to trigger {wrapper_job_name}",
+                          rule_name=f"{ev['event_rule']}",
+                          schedule=events.Schedule.expression(ev['event_schedule'])
+                          )
+
+          rule.add_target(targets.SfnStateMachine(machine=state_machine,
+                                                  role=sfn_iam_role))
+
+      logger.info("Apply tags for state machine %s", state_machine)
+      ConfigUtil.apply_version_tags(resource=state_machine, environment=self.ped_props.app_env)
+      Tags.of(state_machine).add("Name", sfn_name)
+      Tags.of(state_machine).add("WrapperJobName", wrapper_job_arn)
+      Tags.of(state_machine).add("WrapperJobDefinition", wrapper_job_name)
+      self.set_stack_output(self, f"{sfn_name}arn", state_machine.state_machine_arn,
+                            sfn_name, "AWS::StepFunctions::StateMachine")
 
