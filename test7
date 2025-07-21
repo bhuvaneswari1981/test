@@ -1,2 +1,86 @@
+compute_envs_stack:
+  stack_name: "project-ped-{{ app_env }}-computeenvs-stack"
+  vpc_id: "{{ account_vpc_id }}"
+  xray_daemon: true
+  compute_envs:
+    # General purpose compute environment with multiple instance types (v2 for multi-queue)
+    - name: "{{ app_env | title }}CompEnv_v2"
+      role_arn: "{{ iam_arn }}:role/project/{{ project_ped_batch_service_role }}"
+      instance_role_arn: "{{ iam_arn }}:role/project/{{ ec2all_iam_role }}"
+      instance_types: ["m6i.large", "m6i.xlarge", "m6i.2xlarge", "m5.large", "m5.xlarge", "m5.2xlarge"]
+      instance_ami: "vaec-al-2-x86_64-ecs-2023-01-27"
+      minv_cpus: 0
+      maxv_cpus: 256
+      allocation_strategy: "BEST_FIT_PROGRESSIVE"
+      security_groups: ["{{ compute_security_group_id }}"]
+      job_queues:
+        - name: "{{ app_env }}JobQueue_general_high"
+          priority: 3
+          queue_group: "general_purpose"
+        - name: "{{ app_env }}JobQueue_general_medium"
+          priority: 2
+          queue_group: "general_purpose"
+        - name: "{{ app_env }}JobQueue_general_low"
+          priority: 1
+          queue_group: "general_purpose"
+
+    # CPU-optimized compute environment with multiple instance types (v2 for multi-queue)
+    - name: "{{ app_env | title }}CompEnv_c6i_v2"
+      role_arn: "{{ iam_arn }}:role/project/{{ project_ped_batch_service_role }}"
+      instance_role_arn: "{{ iam_arn }}:role/project/{{ ec2all_iam_role }}"
+      instance_types: ["c6i.large", "c6i.xlarge", "c6i.2xlarge", "c5.large", "c5.xlarge", "c5.2xlarge"]
+      instance_ami: "vaec-al-2-x86_64-ecs-2023-01-27"
+      minv_cpus: 0
+      maxv_cpus: 256
+      allocation_strategy: "BEST_FIT_PROGRESSIVE"
+      security_groups: ["{{ compute_security_group_id }}"]
+      job_queues:
+        - name: "{{ app_env }}JobQueue_cpu_high"
+          priority: 3
+          queue_group: "cpu_optimized"
+        - name: "{{ app_env }}JobQueue_cpu_medium"
+          priority: 2
+          queue_group: "cpu_optimized"
+        - name: "{{ app_env }}JobQueue_cpu_low"
+          priority: 1
+          queue_group: "cpu_optimized"
+
+    # Memory-optimized compute environment with multiple instance types (v2 for multi-queue)
+    - name: "{{ app_env | title }}CompEnv_r6i_v2"
+      role_arn: "{{ iam_arn }}:role/project/{{ project_ped_batch_service_role }}"
+      instance_role_arn: "{{ iam_arn }}:role/project/{{ ec2all_iam_role }}"
+      instance_types: ["r6i.large", "r6i.xlarge", "r6i.2xlarge", "r5.large", "r5.xlarge", "r5.2xlarge"]
+      instance_ami: "vaec-al-2-x86_64-ecs-2023-01-27"
+      minv_cpus: 0
+      maxv_cpus: 256
+      allocation_strategy: "BEST_FIT_PROGRESSIVE"
+      security_groups: ["{{ compute_security_group_id }}"]
+      job_queues:
+        - name: "{{ app_env }}JobQueue_memory_high"
+          priority: 3
+          queue_group: "memory_optimized"
+        - name: "{{ app_env }}JobQueue_memory_medium"
+          priority: 2
+          queue_group: "memory_optimized"
+        - name: "{{ app_env }}JobQueue_memory_low"
+          priority: 1
+          queue_group: "memory_optimized"
+
+    # Fargate compute environment (unchanged)
+    - name: "{{ app_env | title }}CompEnv_fargate"
+      role_arn: "{{ iam_arn }}:role/project/{{ project_ped_batch_service_role }}"
+      instance_role_arn: "{{ iam_arn }}:instance-profile/project/{{ ec2all_iam_profile }}"
+      security_groups: ["{{ compute_security_group_id }}"]
+      fargate: true
+      job_queues:
+        - name: "{{ app_env }}JobQueue_fargate_high"
+          priority: 3
+          queue_group: "serverless"
+        - name: "{{ app_env }}JobQueue_fargate_medium"
+          priority: 2
+          queue_group: "serverless"
+        - name: "{{ app_env }}JobQueue_fargate_low"
+          priority: 1
+          queue_group: "serverless"
 
 
