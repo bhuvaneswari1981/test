@@ -1,1 +1,755 @@
+import os
+import logging
+import boto3
+from botocore.exceptions import ClientError
+from aws_cdk import (
+  aws_applicationautoscaling as autoscaling,
+  aws_batch as batch,
+  aws_ec2 as ec2,
+  aws_ecr as ecr,
+  aws_ecs as ecs,
+  aws_elasticloadbalancingv2 as elbv2,
+  aws_events as events,
+  aws_events_targets as targets,
+  aws_iam as iam,
+  aws_lambda as _lambda,
+  aws_sns as sns,
+  aws_cloudwatch as cloudwatch,
+  aws_cloudwatch_actions as cw_actions,
+  aws_ssm as ssm,
+  Duration,
+  Size,
+  Tags,
+  Fn
+)
+from common.cloudformation.client import CloudFormationClient
+from common.lambdas.client import LambdaClient
+from common.utility.config_util import ConfigUtil
+from common.utility.common_util import CommonUtil
+from common.utility.ecs_util import ECSUtil
+from common.utility.batch_util import BatchUtil
+from common.utility.ecr_util import ECRUtil
+import common.utility.promote_util as promote
+import base.ped_stack as ped_stack
+
+logger = logging.getLogger('task_logger')
+lvl = logging.getLevelName(os.environ.get('CB_LOG_LEVEL', 'INFO'))
+logger.setLevel(lvl)
+
+class StackUtil():
+  """
+  StackUtil is a utility class that provides static methods to build and configure various AWS stacks such as Batch, Lambda, and ECS.
+  
+  Integrates with BatchUtil for intelligent queue selection during CDK deployment.
+
+  Methods:
+    build_batch_stack(app, config, batch_stack_settings):
+      Builds and configures an AWS Batch stack with intelligent queue recommendations via BatchUtil.
+
+    build_lambda_stack(app, config, lambda_stack_settings, code_path=os.path.abspath("..")):
+      Builds and configures an AWS Lambda stack based on the provided settings.
+
+    build_ecs_stack(app, config, service_stack_settings):
+      Builds and configures an AWS ECS stack based on the provided settings.
+
+    create_and_configure_rule(app, lambdafunc, lambdaFn, event_input=None):
+      Creates and configures an AWS CloudWatch event rule for the specified Lambda function.
+
+    build_cpu_util_alarm(app, config, app_env, metric_alarm):
+      Builds and configures a CloudWatch alarm for CPU utilization for monitored EC2 instances.
+
+    build_status_chk_alarm(app, config, app_env, metric_alarm):
+      Builds and configures a CloudWatch alarm for status checks for monitored EC2 instances.
+
+    build_memory_chk_alarm(app, config, app_env, metric_alarm):
+      Builds and configures a CloudWatch alarm for memory usage for monitored EC2 instances.
+
+    get_lambda_function_arn_and_name(scope, app_env, stack_name, pattern):
+      Retrieves the ARN and name of a Lambda function based on the provided stack name and pattern.
+  """
+  @staticmethod
+  def build_batch_stack(app, config, batch_stack_settings):
+    logger.info("Processing %s for %s", batch_stack_settings, config['friendly_env'])
+    batch_stack = config[batch_stack_settings]
+    batch_jobs = batch_stack['jobs']
+    app_env = os.environ['APP_ENV']
+    aws_account = str(config['aws_account_id'])
+    aws_region = config['aws_region']
+    common_app_settings = config['common_app_settings']
+
+    for batch_job in batch_jobs:
+      job_name = batch_job['name']
+      image_name = batch_job['image_name']
+      image_tag = batch_job['image_tag']
+      new_image_tag = None
+
+      # if image_tag is set to none, this is not ready to promote to environment
+      if image_tag.lower()== "none" or image_tag is None:
+        logger.info("Cannot promote %s, Image Tag set to %s; it may not be ready to deploy, please check config.",
+                    job_name,
+                    image_tag
+                   )
+        continue
+
+      if 'ready_for_promote' in batch_job:
+        if not CommonUtil.is_target_ready(promote_ready=batch_job['ready_for_promote'], target_env=app_env):
+          logger.info("Cannot promote, %s may not be ready to promote, please check config.", job_name )
+          continue
+
+      if 'target_image_version' in batch_job and batch_job['target_image_version'] != "":
+        image_tag = f"{batch_job['target_image_version']}-{image_tag.split('-')[1]}"
+
+      if (( image_tag == 'latest' ) or ( image_tag is None )):
+        new_image_tag = ECRUtil.get_latest_image_tag_version(image_name)
+      # this is a hack around a promotion issue where the tags are being lost
+      if new_image_tag is not None:
+        image_tag = new_image_tag
+
+      logger.debug("Configuring %s using %s with tag %s", job_name, image_name, image_tag)
+      batch_image_digest = ECRUtil.get_image_digest(scope=app,
+                                                    resource_name=job_name,
+                                                    service_image_name=image_name,
+                                                    image_tag=image_tag)
+      logger.debug("%s batch digest: %s", image_name, batch_image_digest)
+      batch_image_uri = f"{aws_account}.dkr.ecr.{aws_region}.amazonaws.com/{image_name}@{batch_image_digest}"
+
+      logger.info("Batch image uri is: %s", batch_image_uri)
+      func_vars = {}
+      func_vars["APP_ENV"] = app_env
+      for setting in common_app_settings:
+        func_vars[setting['name'].upper()] = setting['value']
+
+      # If environment variables exist, use them
+      if 'environment' in batch_job:
+        logger.info("Processing environment for %s", job_name)
+        env_vars = batch_job['environment']
+        for var in env_vars:
+          if 'value' in var:
+            func_vars[var['name'].upper()] = var['value']
+          else:
+            func_vars[var['name'].upper()] = "TBD"
+
+      command=BatchUtil.batch_command_with_dll(batch_job)
+
+      job_role = iam.Role.from_role_arn(
+        app,
+        job_name + "Role",
+        batch_job['role_arn'],
+        add_grants_to_resources=False,
+        mutable=False,
+      )
+
+      # Get the container image
+      container_image = ecs.ContainerImage.from_registry(batch_image_uri)
+
+      if 'fargate' in batch_job and batch_job['fargate']:
+        logger.info("Processing Fargate Job %s", job_name)
+        # Create Fargate Container Definition
+        batch_container = batch.EcsFargateContainerDefinition(
+          app,
+          id=job_name + "_container",
+          assign_public_ip=False,
+          command=command,
+          cpu=batch_job['cpus'],
+          environment=func_vars,
+          execution_role=job_role,
+          # ARM64 not yet available in govcloud regions for fargate
+          fargate_cpu_architecture=ecs.CpuArchitecture.X86_64,
+          image=container_image,
+          job_role=job_role,
+          memory=Size.gibibytes(int(batch_job['memory_size']))
+        )
+      else:
+        batch_container = batch.EcsEc2ContainerDefinition(
+          app,
+          id=job_name + "_container",
+          command=command,
+          cpu=batch_job['cpus'],
+          environment=func_vars,
+          execution_role=job_role,
+          image=container_image,
+          job_role=job_role,
+          memory=Size.gibibytes(int(batch_job['memory_size']))
+        )
+
+      # Create Job Definition
+      job_def = batch.EcsJobDefinition(
+        app,
+        id=job_name + "_job",
+        container=batch_container,
+        job_definition_name=job_name
+      )
+      job_def_str_value = job_def.node.default_child.ref
+
+      # Use BatchUtil for automatic queue recommendation based on job specs
+      optimal_queue = BatchUtil.select_optimal_queue(
+        cpus=batch_job.get('cpus', 1),
+        memory_gb=int(batch_job.get('memory_size', 8)),
+        fargate=batch_job.get('fargate', False),
+        app_env=app_env
+      )
+      
+      if optimal_queue:
+        logger.info("Job %s recommended queue: %s", job_name, optimal_queue)
+        # Add queue recommendation as tags for operational visibility
+        Tags.of(job_def).add("RecommendedQueue", optimal_queue)
+        
+        # Store queue recommendation in SSM for runtime use
+        raw_job_name = job_name.replace(app_env, "")
+        queue_param_name = f"{raw_job_name}-recommended-queue".title().replace("-", "")
+        queue_param_path = f'/{app_env}/batch/queues/{queue_param_name}'
+        
+        ssm.StringParameter(app,
+                            queue_param_name,
+                            parameter_name=queue_param_path,
+                            string_value=optimal_queue)
+
+      # Store job definition ARN in SSM Parameter Store
+      raw_job_name = job_name.replace(app_env, "")
+      param_name = f"{raw_job_name}-arn".title().replace("-", "")
+      param_path = f'/{app_env}/batch/{param_name}'
+      
+      ssm.StringParameter(app,
+                          param_name,
+                          parameter_name=param_path,
+                          string_value=job_def_str_value)
+      
+      ped_stack.set_stack_output(app, f"{job_name}", param_path, job_name, "AWS::Batch::JobDefinition")
+
+      if 'sns_topic' in batch_job:
+        logger.info("Processing topics for %s", job_name)
+
+        topic_arn=f"{config['sns_arn']}:{batch_job['sns_topic']}"
+        topic = sns.Topic.from_topic_arn(app, f"{job_name}_policy_id", topic_arn)
+        # create polcy statement to allow publish
+        policyStatement = iam.PolicyStatement(
+                            resources=[topic.topic_arn],
+                            actions=["sns:Publish"],
+                            principals=[iam.AnyPrincipal()],
+                            effect=iam.Effect.ALLOW
+                           )
+        topic.add_to_resource_policy(policyStatement)
+
+  @staticmethod
+  def build_lambda_stack(app, config, lambda_stack_settings, code_path=os.path.abspath("..")):
+    logger.info("Processing %s for %s", lambda_stack_settings, config['friendly_env'])
+    #Read in lambda stack configuration
+    lambda_stack=config[lambda_stack_settings]
+    lambda_list = lambda_stack['lambdas']
+    common_app_settings=config['common_app_settings']
+    #Load app specific environment variable
+    app_env = os.environ['APP_ENV']
+    aws_account = str(config['aws_account_id'])
+    lambda_vpc_id = config['account_vpc_id']
+    default_sg = config['compute_security_group_name']
+
+    application_subnet_ids  = config['vpc_app_subnet_grp']
+    application_subnets = []
+    for idx, subnet_id in enumerate(application_subnet_ids):
+      application_subnets.append(
+                                  ec2.Subnet.from_subnet_id(
+                                    scope=app,
+                                    id=f"subnet{idx}",
+                                    subnet_id=subnet_id
+                                  )
+                                )
+
+    lambda_vpc_subnets=ec2.SubnetSelection(subnets=application_subnets)
+    lambda_construct_list = []
+    for lambdafunc in lambda_list:
+      func_vars = {}
+      function_name = lambdafunc['name']
+      image_promote_flag = True
+      if 'image_promote' in lambdafunc:
+        image_promote_flag = lambdafunc['image_promote']
+      logger.info("Processing lambda function %s", function_name)
+      lambda_sg_list = []
+      func_vars["APP_ENV"] = app_env
+      lambda_timout=15
+      if 'timeout' in lambdafunc:
+        lambda_timout=lambdafunc['timeout']
+      for setting in common_app_settings:
+        func_vars[setting['name'].upper()] = setting['value']
+
+      lambda_vpc = ec2.Vpc.from_lookup(app, f"{function_name}_VPC_id", vpc_id=lambda_vpc_id)
+      logger.debug("Set default security group name %s", default_sg)
+      default_lambda_sg = ec2.SecurityGroup.from_lookup_by_name(app,
+                                                        f"{function_name}_{default_sg}_default",
+                                                        security_group_name=default_sg,
+                                                        vpc=lambda_vpc
+                                                        )
+      lambda_sg_list.append(default_lambda_sg)
+
+      if 'ready_for_promote' in lambdafunc:
+        if not CommonUtil.is_target_ready(promote_ready=lambdafunc['ready_for_promote'], target_env=app_env):
+          logger.info("Cannot promote, %s may not be ready to promote, please check config.", function_name )
+          continue
+
+      #If environment variables exist, use them
+      if 'environment' in lambdafunc:
+        logger.debug("Processing environment for %s", function_name)
+        env_vars = lambdafunc['environment']
+        for var in env_vars:
+          if 'value' in var and var['value'] is not None and var['value'].strip() != "":
+            func_vars[var['name']] = var['value']
+          elif 'stack_name' in var:
+            var_stack_name = var['stack_name']
+            #If var name ends with _arn, make sure resource is ready for promote otherwise exclude it
+            if var['name'].lower().endswith("_arn"):
+              print(f"stack_name: {var_stack_name}, name: {var['name']}")
+              if not CommonUtil.is_external_resource_ready(config, app_env, var_stack_name,
+                                                           var['pattern'], var['resource_type']):
+                continue
+
+              if 'circular_dependency' in var and var['circular_dependency']:
+                resource_arn = CommonUtil.handle_circular_dependency_arn(var['resource_type'], config[var_stack_name])
+                func_vars[var['name']] = resource_arn
+                continue
+
+            resource_arn = CloudFormationClient.get_resource_arn(
+                                         stack_name=config[var_stack_name]['stack_name'],
+                                         pattern=var['pattern'],
+                                         resource_type=var['resource_type'],
+                                         app=app,
+                                         app_env=app_env)
+            resource_type_id = resource_arn.split(aws_account)[-1].replace(':','',1)
+            logger.debug("%s using resource_type_id, %s", var['name'], resource_type_id)
+            func_vars[var['name']] = resource_type_id
+
+      if 'sns_topic' in lambdafunc:
+        logger.debug("Processing topics for %s", function_name)
+
+        topic_arn=f"{config['sns_arn']}:{lambdafunc['sns_topic']}"
+        topic = sns.Topic.from_topic_arn(app, f"{function_name}_policy_id", topic_arn)
+        # create polcy statement to allow publish
+        policyStatement = iam.PolicyStatement(
+                            resources=[topic.topic_arn],
+                            actions=["sns:Publish"],
+                            principals=[iam.AnyPrincipal()],
+                            effect=iam.Effect.ALLOW
+                           )
+        topic.add_to_resource_policy(policyStatement)
+
+      if 'security_group_id' in lambdafunc:
+        sg_id = lambdafunc['security_group_id']
+        logger.debug("override security group using specified id %s", sg_id)
+        lambda_sg = ec2.SecurityGroup.from_security_group_id(app,
+                                                            sg_id + "Id",
+                                                            security_group_id=sg_id
+                                                            )
+        lambda_sg_list.append(lambda_sg)
+        lambda_sg_list.remove(default_lambda_sg)
+
+      if 'security_group_name' in lambdafunc:
+        sg_name = lambdafunc['security_group_name']
+        logger.debug("override security group using specified name %s", sg_name)
+        lambda_sg = ec2.SecurityGroup.from_lookup_by_name(app,
+                                                          sg_name + "_lookup",
+                                                          security_group_name=sg_name,
+                                                          vpc=lambda_vpc
+                                                          )
+        lambda_sg_list.append(lambda_sg)
+        lambda_sg_list.remove(default_lambda_sg)
+
+      processor = _lambda.Architecture.X86_64
+      if 'processor' in lambdafunc and lambdafunc['processor'] == 'ARM_64':
+        processor = _lambda.Architecture.ARM_64
+
+      memory_size_mb = lambdafunc['memory_size'] * 1024
+      if 'image_construct' in lambdafunc:
+        image_name = lambdafunc['image_name']
+        image_construct = lambdafunc['image_construct']
+        image_tag = lambdafunc['image_tag']
+        image_source_env = lambdafunc['image_source_env']
+        if image_promote_flag:
+          promote.run_promotion(lambdafunc, config, app_env)
+
+        # if image_tag is set to none, this is not ready to promote to environment
+        if image_tag.lower()== "none" or image_tag is None:
+          logger.info("Cannot promote %s, Image Tag set to %s; it may not be ready to deploy, please check config.",
+                      function_name,
+                      image_tag
+                     )
+          continue
+
+        new_image_tag = None
+        if (( image_tag == 'latest' ) or ( image_tag is None )):
+          new_image_tag = ECRUtil.get_latest_image_tag_version(image_name)
+        # this is a hack around a promotion issue where the tags are being lost
+        if new_image_tag is not None:
+          image_tag = new_image_tag
+        logger.info("Configuring '%s' using '%s' with tag '%s'",
+                    lambdafunc['name'],image_name,image_tag)
+
+        lambda_image_digest = ECRUtil.get_image_digest(scope=app,
+                                                      resource_name=function_name,
+                                                      service_image_name=image_name,
+                                                      image_tag=image_tag)
+        logger.info("Setup %s as docker image using %s",
+                  lambdafunc['name'],image_name)
+
+        lambdaFn = _lambda.DockerImageFunction(
+                      app,
+                      id=function_name + "_Id",
+                      function_name=function_name,
+                      code=_lambda.DockerImageCode.from_ecr(
+                            ecr.Repository.from_repository_name(app, image_construct, image_name),
+                            cmd=lambdafunc['handler'],
+                            tag_or_digest=lambda_image_digest
+                            ),
+                      architecture=processor,
+                      memory_size=memory_size_mb,
+                      timeout=Duration.minutes(lambda_timout),
+                      role=iam.Role.from_role_arn(
+                            app, function_name + "Role",
+                            lambdafunc['role_arn'],
+                            add_grants_to_resources=False,
+                            mutable=False
+                            ),
+                      environment=func_vars,
+                      vpc=lambda_vpc,
+                      vpc_subnets=lambda_vpc_subnets,
+                      security_groups=lambda_sg_list
+                      )
+        ConfigUtil.apply_version_tags(resource=lambdaFn, environment=app_env, image_tag=f"{image_name}/{image_tag}")
+      elif 'runtime' in lambdafunc:
+        logger.info("Setup %s as %s lambda", lambdafunc['name'],lambdafunc['runtime'])
+        lamda_runtime_path = lambda_dir = lambdafunc['lambda_dir']
+
+        if not lambda_dir.startswith('./'):
+          lamda_runtime_path = os.path.join(code_path, 'ped-zip-lambdas', lambda_dir)
+        elif lambda_dir.startswith('./'):
+          lamda_runtime_path = os.path.join(code_path, lambda_dir)
+
+        logger.debug("Lambda runtime path: %s", lamda_runtime_path)
+        lambdaFn = _lambda.Function(
+                      app,
+                      id=function_name,
+                      function_name=function_name,
+                      code=_lambda.Code.from_asset(lamda_runtime_path),
+                      handler=lambdafunc['handler'],
+                      architecture=processor,
+                      memory_size=memory_size_mb,
+                      timeout=Duration.minutes(lambda_timout),
+                      runtime=_lambda.Runtime(lambdafunc['runtime']),
+                      role=iam.Role.from_role_arn(
+                            app,
+                            function_name + "Role",
+                            lambdafunc['role_arn'],
+                            add_grants_to_resources=False,
+                            mutable=False
+                            ),
+                      environment=func_vars,
+                      vpc=lambda_vpc,
+                      vpc_subnets=lambda_vpc_subnets,
+                      security_groups=lambda_sg_list
+                     )
+        ConfigUtil.apply_version_tags(resource=lambdaFn, environment=app_env)
+      else:
+        logger.warning("%s unknown lambda configuration", lambdafunc['name'])
+
+      #If s3 trigger buckets are specified, grant them invoke access
+      if 's3_invoke_permissions' in lambdafunc:
+        buckets = lambdafunc['s3_invoke_permissions']
+        #Loop through the specified buckets and grant them permissions
+        for bucket in buckets:
+          lambdaFn.add_permission(
+                    f"{bucket}Perm",
+                    principal=iam.ServicePrincipal("s3.amazonaws.com"),
+                    action="lambda:InvokeFunction",
+                    source_account=aws_account,
+                    source_arn=f"arn:aws-us-gov:s3:::{bucket}"
+                    )
+      ped_stack.set_stack_output(app, f"{function_name}arn", lambdaFn.function_arn,
+                                 function_name, "AWS::Lambda::Function")
+
+
+      # If event rules are specified, add them
+      if 'event_rule' in lambdafunc and lambdafunc['event_rule'] != '':
+        if 'deploy_event_rule' not in lambdafunc or lambdafunc.get('deploy_event_rule', True):
+          StackUtil.create_and_configure_rule(app, lambdafunc, lambdaFn)
+
+      # If multiple event rules are specified, add them
+      elif 'event_rules' in lambdafunc:
+        for ev in lambdafunc['event_rules']:
+          event_input = None
+          if 'input_actions' in ev:
+            event_input = {}
+            for actions in ev['input_actions']:
+              event_input[actions['name']] = actions['value']
+            logger.info("Input actions: %s", event_input)
+
+          StackUtil.create_and_configure_rule(app, ev, lambdaFn, event_input)
+
+      #check for lambda layer  if layer in lambda.yml, then process
+      if "layers" in lambdafunc:
+        logger.info("Adding layer to function %s", function_name)
+        for layer in lambdafunc['layers']:
+          layer_name = layer['name']
+          # Get layer parameter name from stack export
+          param_name = ped_stack.import_stack_export(layer_name)
+          # Get layer arn along with the layer version from parameter store
+          layer_version_arn = ssm.StringParameter.from_string_parameter_attributes(app,
+                                                                                    function_name + layer_name + "layer",
+                                                                                    parameter_name=param_name,
+                                                                                    simple_name=True).string_value
+          layer = _lambda.LayerVersion.from_layer_version_arn(app,
+                                                              id=function_name + layer_name + "ID",
+                                                              layer_version_arn=layer_version_arn)
+          lambdaFn.add_layers(layer)
+          logger.info("Successfully added layer %s with arn of %s", str(layer_name), layer_version_arn)
+
+          # Tag lambda with <layer name>: <layer arn with version>
+          Tags.of(lambdaFn).add(layer_name, layer_version_arn)
+
+      # check if retries is set, if so, reconfigure the async
+      if 'retries' in lambdafunc:
+        lambdaFn.configure_async_invoke(retry_attempts=lambdafunc['retries'])
+
+      if 'resource_tags' in lambdafunc:
+        for tag in lambdafunc['resource_tags']:
+          Tags.of(lambdaFn).add(tag['name'], tag['value'])
+      Tags.of(lambdaFn).add("Name", function_name)
+
+      lambda_construct_list.append(lambdaFn)
+
+    return lambda_construct_list
+
+  @staticmethod
+  def build_ecs_stack(app, config, service_stack_settings):
+    logger.debug("Processing settings for %s", config['friendly_env'])
+    ecs_stack = config[service_stack_settings]
+    ecs_services = ecs_stack['services']
+
+    for service in ecs_services:
+      # get the service name
+      service_name = service['name']
+      # Create a task Definition
+      logger.info("Define EC2 Task Definition")
+      ec2_task_def = ECSUtil.build_ec2_task_def(app, config, service)
+      # Create an ECS cluster
+      logger.info("Define ecs cluster")
+      ecs_cluster = ECSUtil.build_ecs_cluster(app, config, service)
+      # this controls how many tasks are launched, the default is 1, if not specified
+      desired_task_count=int(service['desired_task_count'])
+
+      logger.info("Define ECS EC2 Service %s", service_name + "_ec2service")
+
+      # Create ecs service
+      ec2_service=ecs.Ec2Service(
+                    app,
+                    service_name + '_ec2service',
+                    cluster=ecs_cluster,
+                    task_definition=ec2_task_def,
+                    service_name=service_name,
+                    desired_count=desired_task_count,
+                    min_healthy_percent=50
+                    )
+
+      if 'ecs_service_scaling' in service and service['ecs_service_scaling']:
+        # Configure service autoscaling based on CPU and Memory Utilization
+        scaling_target = autoscaling.ScalableTarget(app, service_name + "_service_scaling",
+          service_namespace=autoscaling.ServiceNamespace.ECS,
+          resource_id=f"service/{service_name}_cluster/{service_name}",
+          scalable_dimension="ecs:service:DesiredCount",
+          min_capacity=desired_task_count,
+          max_capacity=desired_task_count + 1,
+          role=iam.Role.from_role_arn(app, service_name + "ecs_scaling_role", service['asg_role_arn'])
+        )
+
+        autoscaling.TargetTrackingScalingPolicy(app, service_name + "_scaling_policy_cpu",
+          scaling_target=scaling_target,
+          predefined_metric=autoscaling.PredefinedMetric.ECS_SERVICE_AVERAGE_CPU_UTILIZATION,
+          target_value=70,
+          scale_in_cooldown=Duration.minutes(1),
+          scale_out_cooldown=Duration.minutes(1)
+        )
+
+        autoscaling.TargetTrackingScalingPolicy(app, service_name + "_scaling_policy_memory",
+          scaling_target=scaling_target,
+          predefined_metric=autoscaling.PredefinedMetric.ECS_SERVICE_AVERAGE_MEMORY_UTILIZATION,
+          target_value=50,
+          scale_in_cooldown=Duration.minutes(1),
+          scale_out_cooldown=Duration.minutes(1)
+        )
+
+        scaling_target.node.add_dependency(ec2_service)
+
+      target_type='instance'
+      if 'network_mode' in service and service['network_mode'].upper()=='AWS_VPC':
+        target_type='ip'
+
+      ecs_vpc = ec2.Vpc.from_lookup(app, f"{service_name}_VPC_id", vpc_id=config['account_vpc_id'])
+
+      # Import the Load Balancers
+      nlb=elbv2.NetworkLoadBalancer.from_network_load_balancer_attributes(
+                app,
+                service_name + '_nlb',
+                load_balancer_arn=ECSUtil.get_load_balancer_arn(service['load_balancer']),
+                vpc=ecs_vpc
+                )
+
+      logger.info("Create Target Group %s", service['target_group'])
+      target_group_arn=ECSUtil.create_nlb_target_group(
+                                                       name=service['target_group'],
+                                                       port=int(service['target_port']),
+                                                       vpc_id=config['account_vpc_id'],
+                                                       protocol='TCP',
+                                                       nlb_name=config['nlb_name'],
+                                                       target_type=target_type
+                                                       )
+
+      logger.info("Create Target Group from_target_group_attributes from %s", target_group_arn)
+      target_group = elbv2.NetworkTargetGroup.from_target_group_attributes(app,
+                                                                           f"{service_name}_target_group",
+                                                                           target_group_arn=target_group_arn
+                                                                          )
+
+      if target_group_arn is not None:
+        logger.info("Create listener for %s", target_group_arn)
+        if service['listener_protocol'] == 'TLS':
+          listener_arn = ECSUtil.create_tls_listener(
+                                      lbarn=ECSUtil.get_load_balancer_arn(service['load_balancer']),
+                                      port=int(service['target_port']),
+                                      tgarn=target_group_arn,
+                                      domain_name=service['acm_cert_domain_name']
+                                      )
+        else:
+          listener_arn = ECSUtil.create_tcp_listener(
+                                      lbarn=ECSUtil.get_load_balancer_arn(service['load_balancer']),
+                                      port=int(service['target_port']),
+                                      tgarn=target_group_arn
+                                      )
+        logger.info("listener arn: %s",listener_arn)
+      logger.info("Remove any unused with the environment tag")
+      ec2_service.attach_to_network_target_group(target_group=target_group)
+
+  @staticmethod
+  def create_and_configure_rule(app, lambdafunc, lambdaFn, event_input=None):
+    logger.info(lambdafunc)
+    enabled = True
+    if 'event_enabled' in lambdafunc:
+      enabled = lambdafunc['event_enabled']
+    rule = events.Rule(
+            app,
+            lambdafunc['event_rule'] + '_Rule',
+            enabled=enabled,
+            schedule=events.Schedule.expression(lambdafunc['event_schedule']),
+            )
+
+    rule.add_target(targets.LambdaFunction(lambdaFn,
+                                            event=events.RuleTargetInput.from_object(event_input)
+                                            ))
+
+  @staticmethod
+  def build_cpu_util_alarm(app, config, app_env, metric_alarm):
+    monitored_instances = config['monitored_ec2_instances']
+    instance_ids = []
+    for instance in monitored_instances:
+      instance_ids.append(CommonUtil.get_ec2_by_name(instance['name']))
+
+    for instance_id in instance_ids:
+      print(f"Adding CPU Utilization alarm to Instance ID: {instance_id}")
+
+      cpuMetric = cloudwatch.Metric(
+        metric_name="CPUUtilization",
+        namespace="AWS/EC2",
+        dimensions_map={
+          "InstanceId": instance_id
+        },
+        statistic="avg",
+        period=Duration.minutes(metric_alarm['period'])
+      )
+
+      cpuAlarm = cloudwatch.Alarm(app, f"{app_env}-cpu-warn-{instance_id}",
+        evaluation_periods=metric_alarm['eval_periods'],
+        comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        metric=cpuMetric,
+        threshold=metric_alarm['threshold'],
+        datapoints_to_alarm=metric_alarm['datapoints_to_alarm']
+      )
+
+      sns_topic_arn = f"{config['sns_arn']}:{config['cloudwatch_metrics_stack']['sns_topic']}"
+      cpuAlarm.add_alarm_action(
+        cw_actions.SnsAction(sns.Topic.from_topic_arn(app, f"{instance_id}_cpu_get_topic", sns_topic_arn))
+      )
+
+  @staticmethod
+  def build_status_chk_alarm(app, config, app_env, metric_alarm):
+    monitored_instances = config['monitored_ec2_instances']
+    instance_ids = []
+    for instance in monitored_instances:
+      instance_ids.append(CommonUtil.get_ec2_by_name(instance['name']))
+
+    for instance_id in instance_ids:
+      print(f"Adding Status Checks alarm to Instance ID: {instance_id}")
+
+      statusChecksMetric = cloudwatch.Metric(
+        metric_name="StatusCheckFailed",
+        namespace="AWS/EC2",
+        dimensions_map={
+          "InstanceId": instance_id
+        },
+        statistic="max",
+        period=Duration.minutes(metric_alarm['period'])
+      )
+
+      statusChecksAlarm = cloudwatch.Alarm(app, f"{app_env}-status-check-failed-{instance_id}",
+        evaluation_periods=metric_alarm['eval_periods'],
+        comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        metric=statusChecksMetric,
+        threshold=metric_alarm['threshold'],
+        datapoints_to_alarm=metric_alarm['datapoints_to_alarm']
+      )
+
+      sns_topic_arn = f"{config['sns_arn']}:{config['cloudwatch_metrics_stack']['sns_topic']}"
+      statusChecksAlarm.add_alarm_action(
+        cw_actions.SnsAction(sns.Topic.from_topic_arn(app, f"{instance_id}_status_get_topic", sns_topic_arn))
+      )
+
+  @staticmethod
+  def build_memory_chk_alarm(app, config, app_env, metric_alarm):
+    monitored_instances = config['monitored_ec2_instances']
+    for instance in monitored_instances:
+      instance_name = instance['name']
+      print(f"Adding Memory alarm to Instance ID: {instance_name}")
+
+      memoryMetric = cloudwatch.Metric(
+        metric_name="mem_used_percent",
+        namespace="CWAgent",
+        dimensions_map={
+          "host": f"{instance_name}.va.gov"
+        },
+        statistic="Average",
+        period=Duration.minutes(metric_alarm['period'])
+      )
+
+      memoryAlarm = cloudwatch.Alarm(app, f"{app_env}-memory-warn-{instance_name}",
+        evaluation_periods=metric_alarm['eval_periods'],
+        comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        metric=memoryMetric,
+        threshold=metric_alarm['threshold'],
+        datapoints_to_alarm=metric_alarm['datapoints_to_alarm']
+      )
+
+      sns_topic_arn = f"{config['sns_arn']}:{config['cloudwatch_metrics_stack']['sns_topic']}"
+      memoryAlarm.add_alarm_action(
+        cw_actions.SnsAction(sns.Topic.from_topic_arn(app, f"{instance_name}_memory_get_topic", sns_topic_arn))
+      )
+
+  @staticmethod
+  def get_lambda_function_arn_and_name(scope, app_env, stack_name, pattern):
+
+    function_name = CloudFormationClient.get_resource_arn(stack_name=stack_name,
+                                                          pattern=pattern,
+                                                          app=scope,
+                                                          app_env=app_env,
+                                                          resource_type="AWS::Lambda::Function")
+    try:
+      function_arn = LambdaClient.get_function_arn(function_name=function_name)
+    except:
+      function_arn = function_name
+      function_name = Fn.select(6, Fn.split(":", function_arn))
+
+    return function_arn, function_name
 
