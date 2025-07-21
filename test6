@@ -1,1 +1,1164 @@
+common_util.py
+import subprocess
+import re
+import os
+import json
+from operator import itemgetter
+from collections import OrderedDict
+import boto3
+from botocore.exceptions import ClientError
+from aws_cdk import DefaultStackSynthesizer
+
+from common.lambdas.layers.default.custom_logger import logger
+from common.utility.config_util import ConfigUtil
+from common.utility.validate_util import ValidateUtil
+from common.utility.ecr_util import ECRUtil
+from common.utility.batch_util import BatchUtil
+
+config_version = os.environ.get('CONFIG_VERSION')
+
+class CommonUtil():
+  '''
+  Utility class providing common functionality for AWS resource handling and deployment.
+  This class contains static methods for working with various AWS services including ECR, Lambda,
+  S3, SNS, Parameter Store, and more. It provides functionality for validation, deployment,
+  resource lookup, and policy management.
+  
+  Main capabilities include:
+  - Processing and validating ECR images
+  - Managing Lambda functions and their triggers
+  - Deploying project resources
+  - Setting bucket and SNS policies
+  - Sending SNS notifications
+  - Managing CloudFormation stacks
+  - Working with Parameter Store
+  - Accessing EC2 instances and load balancers
+  - Handling resource dependencies
+  
+  Note: Batch job functionality (job definitions, commands, queue management) is handled
+  by the specialized BatchUtil class for better separation of concerns and enhanced
+  multi-queue support.
+  
+  The class serves as a core utility for AWS infrastructure management across different
+  environments (development, testing, production) and supports deployment workflows
+  with comprehensive logging and validation.
+  '''
+  @staticmethod
+  def handle_ecr_images(app_env=None, settings=None):
+    """
+    Process and validate ECR images for a specific application environment.
+    This function retrieves ECR repositories for the given application environment,
+    logs information about images with the 'latest' tag, and validates the ECR setup
+    against the provided settings.
+    Args:
+      app_env (str, optional): Application environment name. If None, it will be 
+                  retrieved from the APP_ENV environment variable.
+      settings (dict, optional): Configuration settings. If None, settings will be 
+                   loaded from ansible config files based on app_env.
+    Returns:
+      None
+    Environment Variables:
+      - CODEBUILD_SRC_DIR_devops: Directory path for the devops source code
+      - APP_ENV: Current application environment if app_env parameter is not provided
+    Note:
+      This function only processes repositories whose names start with the app_env
+      prefix followed by a hyphen (e.g., 'dev-', 'prod-').
+    """
+    logger.info(" ********** Validation results for %s ECR Images ************", app_env)
+    env_dir = os.environ.get('CODEBUILD_SRC_DIR_devops')
+
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+    if env_dir is None:
+      env_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=env_dir, type="ansible", app_env=app_env)
+
+    ecr_client = boto3.client('ecr')
+    next_token = None
+    while True:
+      if next_token is not None:
+        ecr_rsp = ecr_client.describe_repositories(nextToken=next_token)
+      else:
+        ecr_rsp = ecr_client.describe_repositories()
+      ecr_repos = ecr_rsp['repositories']
+      for repo in ecr_repos:
+        name = repo['repositoryName']
+        if not name.startswith(app_env + "-"):
+          continue
+        image_next_token = None
+        while True:
+          if image_next_token is not None:
+            images = ecr_client.describe_images(repositoryName=name, nextToken=image_next_token)
+          else:
+            images = ecr_client.describe_images(repositoryName=name)
+          for image in images['imageDetails']:
+            if 'imageTags' in image and 'latest' in image['imageTags']:
+              tag = [x for x in image['imageTags'] if 'latest' not in x]
+              logger.info("repo: %s, image tag is %s", name, tag)
+          if 'nextToken' not in images:
+            break
+          image_next_token = images['nextToken']
+      if 'nextToken' not in ecr_rsp:
+        break
+      next_token = ecr_rsp['nextToken']
+    ValidateUtil.validate_ecr(settings=settings)
+
+  @staticmethod
+  def handle_lambdas(app_env=None,proj_list=None, settings=None):
+    """
+    Validates and retrieves information about AWS Lambda functions for a specific environment.
+    This function connects to AWS Lambda, lists all functions, and processes their versions
+    based on the provided environment and project filters. Results are returned as an ordered dictionary.
+    Args:
+      app_env (str, optional): The application environment to validate. If not provided,
+                    it will be retrieved from the APP_ENV environment variable.
+      proj_list (list, optional): List of projects to filter Lambda functions. If None,
+                    all Lambda functions will be processed.
+      settings (dict, optional): Configuration settings. If None, settings will be loaded
+                      from ansible config for the specified environment.
+    Returns:
+      OrderedDict: A sorted dictionary containing Lambda function information with function names
+            as keys and their respective details as values.
+    Note:
+      This function makes API calls to AWS Lambda service and processes results in batches
+      to handle potential pagination in the AWS response.
+    """
+    logger.info(" ********** Validation results for %s Lambdas ************", app_env)
+    env_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=env_dir, type="ansible", app_env=app_env)
+
+    lambda_client = boto3.client('lambda')
+    next_marker = ""
+    image_dict = {}
+    if proj_list is None:
+      proj_list=[]
+
+    while True:
+      if len(next_marker) != 0:
+        functions_rsp = lambda_client.list_functions(Marker=next_marker)
+      else:
+        functions_rsp = lambda_client.list_functions()
+
+      CommonUtil.get_lambda_versions(client=lambda_client,
+                                    functions_list=functions_rsp['Functions'],
+                                    image_dict=image_dict,
+                                    app_env=app_env,proj_list=proj_list,settings=settings)
+      if 'NextMarker' not in functions_rsp:
+        break
+      next_marker = functions_rsp['NextMarker']
+
+    return OrderedDict(sorted(image_dict.items()))
+
+  @staticmethod
+  def handle_triggers(app_env=None,proj_list=None, settings=None):
+    """
+    Process triggers for specified environment and project list.
+    This function fetches S3 buckets for a given environment and validates
+    their Lambda triggers using CommonUtil.get_lambda_triggers.
+    Args:
+      app_env (str): The application environment to filter buckets (e.g., 'dev', 'prod').
+               Default is an empty string.
+      proj_list (list, optional): List of projects to process. Defaults to None, which 
+                    is treated as an empty list.
+    Returns:
+      None: Results are logged but not returned.
+    Notes:
+      - Buckets are filtered to include only those starting with "project-ped" and 
+        ending with the specified environment, or starting with the environment name.
+      - The function handles S3 pagination using NextMarker.
+      - Results are logged with an environment-specific header.
+    """
+    logger.info(" ********** Validation results for %s Triggers ************", app_env)
+
+    s3_client = boto3.client('s3')
+    next_marker = ""
+    env_buckets = []
+    if proj_list is None:
+      proj_list=[]
+    env_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..','..','..'))
+    if app_env is None:
+      app_env=os.environ['APP_ENV']
+
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=env_dir, type="ansible", app_env=app_env)
+
+    while True:
+      if len(next_marker) != 0:
+        response = s3_client.list_buckets(Marker=next_marker)
+      else:
+        response = s3_client.list_buckets()
+
+      for bucket in response ['Buckets']:
+        bname=bucket['Name']
+        if (bname.startswith("project-ped") and bname.endswith(f"-{app_env}")) or bname.startswith(f"{app_env}-"):
+          env_buckets.append(bucket)
+
+      CommonUtil.get_lambda_triggers(client=s3_client,
+                                    bucket_list=env_buckets,
+                                    app_env=app_env, settings=settings)
+      if 'NextMarker' not in response:
+        break
+      next_marker = response['NextMarker']
+
+  @staticmethod
+  def get_lambda_versions(client=boto3.client('lambda',os.environ.get('AWS_REGION')),
+                           functions_list=None, image_dict=None, app_env=None, proj_list=None, settings=None):
+    """
+    Retrieves version information from AWS Lambda functions and validates their configurations.
+    This function iterates through a list of Lambda functions, extracts their configuration and image
+    version information, and validates them against expected values. It also builds a dictionary
+    of image versions for referenced Lambda container images.
+    Args:
+      client (boto3.client): AWS Lambda client to use for API calls. Defaults to a client
+                  configured with the AWS_REGION from environment variables.
+      functions_list (list, optional): List of Lambda function metadata dictionaries. Each dictionary
+                      should contain at least a 'FunctionName' key. Defaults to an
+                      empty list.
+      image_dict (dict, optional): Dictionary to store image name and version mappings.
+                    Will be populated with entries in the format
+                    {"image_name:": "\"image_version\""}. Defaults to an empty dict.
+      app_env (str, optional): Application environment identifier used for filtering functions.
+                  Only functions ending with this environment suffix will be processed.
+      proj_list (list, optional): List of projects for validation. Passed to validate_lambda_version.
+                      Defaults to an empty list.
+      settings (object, optional): Configuration settings used for validation. Passed to
+                    validate_lambda_version.
+    Returns:
+      None: This function doesn't return a value but updates the image_dict parameter with
+          collected image versions.
+    Note:
+      - The function filters Lambda functions to only process those starting with "project-ped"
+        and ending with the specified app_env.
+      - For container images, the function extracts and formats the image tag for validation.
+      - The function calls ValidateUtil.validate_lambda_version to verify Lambda configurations.
+    """
+
+    if functions_list is None:
+      functions_list=[]
+    if image_dict is None:
+      image_dict={}
+    if proj_list is None:
+      proj_list=[]
+
+    for func in functions_list:
+      name = func['FunctionName']
+      env_vars= {}
+      # Skip functions that don't match our naming pattern
+      if not (name.startswith("project-ped") and name.endswith(f"-{app_env}")):
+        continue
+
+      func_config_version = "N/A"
+      image_version = "N/A"
+
+      # Get function details
+      resp = client.get_function(FunctionName=name)
+
+      # Extract config version from tags
+      if "Tags" in resp and "CONFIG_VERSION" in resp["Tags"]:
+        func_config_version = resp["Tags"]["CONFIG_VERSION"]
+
+      # Extract environment variables
+      if "Environment" in resp['Configuration'] and "Variables" in resp['Configuration']["Environment"]:
+        env_vars = resp['Configuration']['Environment']['Variables']
+
+      # Process image URI if present
+      if "ImageUri" in resp["Code"]:
+        image_version = ECRUtil.translate_image_tag_type(image_uri=resp['Code']['ImageUri'])
+
+        # Handle case where image_version is a list
+        if isinstance(image_version, list):
+          for image in image_version:
+            if image != "latest":
+              image_version = image
+              break
+
+        # Extract and format image name for dictionary
+        image_name = resp['Code']['ImageUri'].split("/")[-1]
+        image_name = image_name.split(":")[0].split("@")[0]
+        image_name = image_name.replace("-", "_").replace(f"{app_env}_vfmp_", "deployment_version_")
+
+        # Add to image dictionary if not already present
+        if f"{image_name}:" not in image_dict:
+          image_dict[f"{image_name}:"] = f"\"{image_version}\""
+
+      # Validate lambda version with collected data
+      ValidateUtil.validate_lambda_version(name, image_version,
+                                           env_vars, func_config_version, proj_list=proj_list, settings=settings)
+
+  @staticmethod
+  def get_lambda_triggers(client=boto3.client('s3'), bucket_list=None, app_env=None, settings=None):
+    """
+    Retrieves and validates lambda function triggers configured for S3 buckets.
+    This function scans through a list of S3 buckets, retrieves their notification configurations,
+    extracts lambda function triggers, and validates them using ValidateUtil.validate_lambda_triggers.
+    Parameters:
+    -----------
+    client : boto3.client
+      The boto3 S3 client instance to use for API calls. Defaults to boto3.client('s3').
+    bucket_list : list, optional
+      A list of dictionaries containing bucket information with 'Name' key.
+      If None, defaults to an empty list.
+    app_env : str, optional
+      Application environment string used to normalize lambda function names.
+    Returns:
+    --------
+    None
+      The function does not return a value but logs validation information and
+      calls ValidateUtil.validate_lambda_triggers for each lambda trigger found.
+    Notes:
+    ------
+    - The function expects each bucket in bucket_list to have a 'Name' key
+    - Lambda function names are normalized by removing hyphens and the app_env suffix
+    - Filter rules for trigger paths are processed to remove trailing slashes
+    """
+    if bucket_list is None:
+      bucket_list=[]
+
+    for bucket in bucket_list:
+      bucket_name = bucket['Name']
+      response = client.get_bucket_notification_configuration(Bucket=bucket_name)
+      if response.get('LambdaFunctionConfigurations') is not None:
+        for trigger in response['LambdaFunctionConfigurations']:
+          filter_list = trigger['Filter']['Key']["FilterRules"]
+          lambda_arn = trigger['LambdaFunctionArn']
+          lambda_function_name = lambda_arn.split(':')[-1].replace("-", "").replace(app_env,"")
+          trigger_folder = [path['Value'] for path in filter_list if 'Value' in path]
+          trigger_folder_path = [element.rstrip("/") for element in trigger_folder if len(element) > 0]
+          logger.info("Validate event notification triggers on %s/%s for %s",
+                      bucket_name, trigger_folder_path, lambda_function_name)
+          ValidateUtil.validate_lambda_triggers(lambda_function_name,trigger_folder_path,bucket_name, settings=settings)
+
+
+
+  @staticmethod
+  def print_resource_versions(app_env="", proj_list=None, configs=None, **kwargs):
+    """
+    Prints resource versions and deployment information for the specified environment.
+    This function processes and displays information about various AWS resources such as
+    Lambda functions, job definitions, ECR images, and triggers. It also reports on validation
+    results and deployment status.
+    Parameters:
+    -----------
+    app_env : str, optional
+      The application environment to process (e.g., "dev", "prod"). Defaults to empty string.
+    proj_list : list, optional
+      List of projects to process. Defaults to an empty list.
+    configs : dict, optional
+      Configuration settings for the resources.
+    **kwargs : dict
+      Optional arguments to process specific resource types:
+      - "ecr_images": Process ECR images only
+      - "lambdas": Process Lambda functions only
+      - "job_definition": Process job definitions only
+    Returns:
+    --------
+    None
+      This function logs the results to the configured logger.
+    Notes:
+    ------
+    The function displays:
+    - Resource information for the specified environment
+    - Validation results for non-deployed projects
+    - Deployment report including successfully updated Lambdas and Batch Jobs
+    - Any deployment validation failures
+    """
+    logger.info("*** Printing resources for environment: %s ***", app_env)
+    if proj_list is None:
+      proj_list=[]
+
+    if len(kwargs) == 0:
+      BatchUtil.handle_job_definitions(app_env=app_env, settings=configs)
+      CommonUtil.handle_lambdas(app_env=app_env,proj_list=proj_list, settings=configs)
+      CommonUtil.handle_triggers(app_env=app_env,proj_list=proj_list, settings=configs)
+      CommonUtil.handle_ecr_images(app_env=app_env, settings=configs)
+    else:
+      for key in kwargs:
+        arg_value = kwargs.get(key)
+        if arg_value == "ecr_images":
+          CommonUtil.handle_ecr_images(app_env=app_env, settings=configs)
+        elif arg_value == "lambdas":
+          CommonUtil.handle_lambdas(app_env=app_env,proj_list=proj_list, settings=configs)
+        elif arg_value == "job_definition":
+          BatchUtil.handle_job_definitions(app_env=app_env, settings=configs)
+        else:
+          logger.error("Invalid argument %s", arg_value)
+    if ValidateUtil.non_deployed_project_validation:
+      logger.info("***** Validation For Non Deployed Projects *****")
+      logger.info("Item Validation : %s", len(ValidateUtil.non_deployed_project_validation))
+      for item in sorted(ValidateUtil.non_deployed_project_validation,key=itemgetter('Type')):
+        logger.info(item)
+    logger.info("***** Deployment report *****")
+    if ValidateUtil.lambda_image_versions:
+      logger.info("Lambdas Updated Successfully: %s", len(ValidateUtil.lambda_image_versions))
+      for item in sorted(ValidateUtil.lambda_image_versions,key=itemgetter('Item')):
+        logger.info(item)
+    if ValidateUtil.job_image_versions:
+      logger.info("Batch Jobs Updated Successfully: %s", len(ValidateUtil.job_image_versions))
+      for item in sorted(ValidateUtil.job_image_versions,key=itemgetter('Item')):
+        logger.info(item)
+    if ValidateUtil.deployment_validation_failures:
+      logger.info("***** Deployment Validation Failures *****")
+      logger.info("Deployment Validation Issues: %s", len(ValidateUtil.deployment_validation_failures))
+      for item in sorted(ValidateUtil.deployment_validation_failures,key=itemgetter('Type')):
+        logger.info(item)
+
+  @staticmethod
+  def get_final_project_list(proj_list=None, settings=None):
+    """
+    Processes a list of projects and filters them based on environment variables.
+    This function takes a list of projects and processes it based on INCLUDE_PROJ_LIST
+    and SKIP_PROJ_LIST environment variables. It expands project names to individual
+    transactions using the settings dictionary, and then applies inclusion or exclusion
+    filters.
+    Args:
+      proj_list (list, optional): List of project names to process. Defaults to an empty list.
+      settings (dict, optional): Configuration dictionary that maps project names to
+                   lists of individual transactions. If None, it's read from
+                   the environment using ConfigUtil.
+    Returns:
+      list: The final list of individual transactions after applying inclusion/exclusion filters.
+    Raises:
+      Exception: If both INCLUDE_PROJ_LIST and SKIP_PROJ_LIST environment variables are provided.
+    Notes:
+      - INCLUDE_PROJ_LIST and SKIP_PROJ_LIST should be comma-separated values in environment variables
+      - If a project in these lists exists in settings, it's expanded to its individual transactions
+      - Otherwise, the project name itself is treated as an individual transaction
+      - When using INCLUDE_PROJ_LIST, only transactions in this list will be included
+      - When using SKIP_PROJ_LIST, transactions in this list will be excluded
+    """
+    #proj_list contains list of projects, not individual transaction
+    #skip_list and include_list can have project or individual transaction
+    #if both skip_list and include_list provided then it returns error
+    #convert proj_list into individual transaction. Then convert include_list/skip_list into individual transaction so
+    #these can be included or excluded
+
+    if proj_list is None:
+      proj_list=[]
+
+    if settings is None:
+      settings = ConfigUtil.read_config(directory=os.environ.get('CODEBUILD_SRC_DIR'),
+                                      type="ansible",
+                                      app_env=os.environ['APP_ENV']
+                                      )
+    skip_proj_list = []
+    include_proj_list = []
+
+    #If a project list was defined, read it from the environment
+    if "INCLUDE_PROJ_LIST" in os.environ and len(os.environ['INCLUDE_PROJ_LIST'].strip()) > 0:
+      logger.debug("Creating include_proj_list")
+      include_proj_list = [x.strip() for x in os.environ['INCLUDE_PROJ_LIST'].split(",") if len(x.strip()) > 0 ]
+    if "SKIP_PROJ_LIST" in os.environ and len(os.environ['SKIP_PROJ_LIST'].strip()) > 0:
+      logger.debug("Creating skip_proj_list")
+      skip_proj_list = [x.strip() for x in os.environ['SKIP_PROJ_LIST'].split(",") if len(x.strip()) > 0 ]
+
+    #if both include_list and skip_list provided return error
+    if len(include_proj_list) > 0 and len(skip_proj_list) > 0:
+      raise Exception("Error: Either INCLUDE_PROJ_LIST or SKIP_PROJ_LIST env variable accepted, but not both")
+
+    #Loop through the projects and replace each project with individual transaction
+    proj_new_list = []
+    for key in proj_list:
+      logger.debug("Found %s proj_list", key)
+      if key in settings:
+        logger.debug("create new list from %s", settings[key])
+        new_list = settings[key]
+        for i in new_list:
+          logger.debug("Append %s to proj_new_list", i)
+          proj_new_list.append(i)
+      else:
+        logger.debug("%s not in settings, add %s to proj_new_list", key, key)
+        proj_new_list.append(key)
+    proj_list = proj_new_list
+
+    #Loop through the projects in include_proj_list and replace each project with individual transaction
+    # if individual transaction is specified instead of project in the include_list then add the transaction
+    if len(include_proj_list) > 0:
+      new_include_list = []
+      for incl_proj in include_proj_list:
+        logger.debug("Found %s include_proj_list", incl_proj)
+        if incl_proj in settings:
+          for proj in settings[incl_proj]:
+            logger.debug("add tonew_include_list from %s", proj)
+            new_include_list.append(proj)
+        else:
+          logger.debug("%s not in settings, add %s to new_include_list", incl_proj, incl_proj)
+          new_include_list.append(incl_proj)
+
+      #compare the include list with project list and include the valid projects
+      #This will exclude if invalid project/transaction is specified in include_proj_list
+      new_proj_list = []
+      for incl_proj in proj_list:
+        if (incl_proj in new_include_list or incl_proj.split('/')[1] in new_include_list):
+          new_proj_list.append(incl_proj)
+      proj_list = new_proj_list
+      return proj_list
+
+    #Loop through the projects in include_proj_list and replace each project with individual transaction
+    # if individual transaction is specified instead of project in the skip_list then add the transaction
+    if len(skip_proj_list) > 0:
+      new_skip_list = []
+      for skip_proj in skip_proj_list:
+        if skip_proj in settings:
+          for proj in settings[skip_proj]:
+            new_skip_list.append(proj)
+        else:
+          new_skip_list.append(skip_proj)
+
+      #compare the skip list with project list and include the valid projects
+      new_proj_list = []
+      for skip_proj in proj_list:
+        logger.info("skip project %s", skip_proj)
+        if (skip_proj.split('/')[-1] not in new_skip_list and skip_proj not in new_skip_list):
+          new_proj_list.append(skip_proj)
+      proj_list = new_proj_list
+    logger.debug("returning project list: %s", proj_list)
+    return proj_list
+
+  @staticmethod
+  def deploy_project_list(proj_list=None, configs=None):
+    #Keep track of the root path
+    root_dir = os.path.abspath("..")
+
+    rel_tag = ""
+
+    if proj_list is None:
+      proj_list=[]
+    if configs is None:
+      configs={}
+
+    #If the RELEASE_TAG environment variable was defined, capture it here
+    if 'RELEASE_TAG' in os.environ:
+      rel_tag = os.environ['RELEASE_TAG']
+
+    # project mappings
+    project_mappings = {
+      "batch_stack": {
+          "directory": "cdk/ped-batch-jobs",
+          "arg_split_index": 1
+      },
+      "lambda_stack": {
+          "directory": "cdk/ped-common-lambdas",
+          "arg_split_index": 1
+      },
+      "job_wrapper": {
+          "directory": "cdk/ped-job-wrapper",
+          "arg_split_index": 1
+      },
+      "param_store": {
+          "directory": lambda configs, root_dir: (
+              f"{root_dir}/sdk/ped-parameter-store"
+              if 'param_store_sdk' in configs and configs['param_store_sdk']
+              else f"{root_dir}/cdk/ped-parameter-store"
+          ),
+          "arg_split_index": None
+      },
+      "sqs_sfn": {
+          "directory": "cdk/ped-poll-sqs-stepfunction",
+          "arg_split_index": 1
+      },
+      "sqs_queue": {
+          "directory": "cdk/ped-sqs-queue",
+          "arg_split_index": 1
+      },
+      "db_script": {
+          "directory": "sdk/ped-automate-db-scripts",
+          "arg_split_index": 1
+      },
+      "cfn_stack_arg": {
+          "directory": "cdk/ped-cfn-template",
+          "arg_split_index": 1
+      }
+    }
+
+    # Loop through the project list
+    for project in proj_list:
+      logger.info("Deploy project %s", project)
+
+      project_arg = ""
+      proj_split = project.split("/")
+
+      # Default case
+      project_type = proj_split[0]
+      project_mapping = project_mappings.get(project_type, None)
+
+      # Add enhanced logging for batch-related deployments
+      if project_type == "batch_stack":
+        logger.info("Deploying batch stack with multi-queue support enabled")
+        # Check if we can analyze queue configuration
+        try:
+          app_env=os.environ['APP_ENV']
+          available_queues = BatchUtil.get_available_job_queues(queue_prefix=app_env)
+          if available_queues:
+            logger.info("Found %d existing job queues for environment %s", len(available_queues), app_env)
+          else:
+            logger.info("No existing queues found - deploying new multi-queue infrastructure")
+        except Exception as ex:
+          logger.debug("Could not check existing queues during deployment: %s", str(ex))
+
+      if project_mapping:
+        # Determine the directory to change to
+        if isinstance(project_mapping['directory'], str):
+          target_directory = f"{root_dir}/{project_mapping['directory']}"
+        else:
+          target_directory = project_mapping['directory'](configs, root_dir)
+
+        os.chdir(target_directory)
+
+        # Determine project_arg if applicable
+        if project_mapping['arg_split_index'] is not None:
+          project_arg = proj_split[project_mapping['arg_split_index']]
+        else:
+          project_arg = project
+
+      else:
+        # Default case: cd to project directory
+        os.chdir(f"{root_dir}/{project}")
+
+      #If an alternate relase file was found, replace the current app with it
+      if len(rel_tag) > 0 and os.path.exists(f"app.py.{rel_tag}"):
+        os.replace(f"app.py.{rel_tag}", "app.py")
+
+      #Change the permissions on the build.sh just in case
+      os.system("chmod 755 build.sh")
+
+      #Execute the build.sh script
+      script_output = subprocess.run(f"/bin/bash build.sh {project_arg}", shell=True, check=True)
+      if script_output.returncode != 0:
+        raise Exception(f"Error occurred while deploying project: {project}")
+
+      # Post-deployment analysis for batch stacks
+      if project_type == "batch_stack":
+        try:
+          app_env=os.environ['APP_ENV']
+          available_queues = BatchUtil.get_available_job_queues(queue_prefix=app_env)
+          if available_queues:
+            queue_groups = {}
+            for queue in available_queues:
+              # Extract queue group from naming pattern
+              if "_general_" in queue['name']:
+                group = "general_purpose"
+              elif "_cpu_" in queue['name']:
+                group = "cpu_optimized"
+              elif "_memory_" in queue['name']:
+                group = "memory_optimized"
+              elif "_fargate_" in queue['name']:
+                group = "serverless"
+              else:
+                group = "other"
+              
+              if group not in queue_groups:
+                queue_groups[group] = 0
+              queue_groups[group] += 1
+            
+            logger.info("Batch deployment completed - Queue distribution: %s", queue_groups)
+        except Exception as ex:
+          logger.debug("Could not analyze queues after deployment: %s", str(ex))
+
+      #cd back to root directory
+      os.chdir(root_dir)
+
+
+
+  @staticmethod
+
+  def set_bucket_policy(bucket, principal, policy_name, prefix_list=None, action=None):
+    """
+    Sets or updates an S3 bucket policy with specified permissions.
+    This method adds or updates a policy for a specific principal on an S3 bucket.
+    If the bucket does not have a policy yet, creates a new policy. If a policy
+    with the same name (Sid) already exists, it will be updated.
+    Args:
+      bucket (str): Name of the S3 bucket to set policy for
+      principal (dict): AWS principal to grant permissions to (e.g., {"AWS": "arn:aws:iam::account-id:role/role-name"})
+      policy_name (str): Unique identifier (Sid) for the policy statement
+      prefix_list (list, optional): List of object prefixes to apply the policy to.
+                    If None, applies to all objects in bucket. Defaults to None.
+      action (list, optional): List of S3 actions to allow. Defaults to ["s3:PutObject"] if None.
+    Raises:
+      ClientError: If there's an error creating or updating the bucket policy
+    Returns:
+      None
+    """
+    logger.debug("Set policy for %s on %s", principal, bucket)
+
+    if action is None:
+      action=["s3:PutObject"]
+
+    s3_arn_resource_list = []
+    if prefix_list is None or not prefix_list:
+      s3_arn_resource_list.append(f"arn:aws-us-gov:s3:::{bucket}/*")
+    else:
+      for prefix in prefix_list:
+        s3_arn_resource_list.append(f"arn:aws-us-gov:s3:::{bucket}/{prefix}")
+
+    bucket_policy = {
+      "Sid": policy_name,
+      "Effect": "Allow",
+      "Principal": principal,
+      "Action": action,
+      "Resource": s3_arn_resource_list
+    }
+
+    # try:
+    _s3 = boto3.client('s3')
+
+    try:
+      # get current bucket policy to append to bucket
+      policy_response = _s3.get_bucket_policy(Bucket=bucket)
+    except ClientError as ce:
+      logger.info("ClientError Code: %s",ce.response['Error']['Code'])
+      if ce.response['Error']['Code'] == 'NoSuchBucketPolicy':
+        try:
+          logger.info("No bucket policy found, creating new")
+          full_bucket_policy = { 'Version': '2012-10-17', 'Statement': [bucket_policy] }
+          full_bucket_policy_json = json.dumps(full_bucket_policy)
+          _s3.put_bucket_policy(Bucket=bucket, Policy=full_bucket_policy_json)
+        except ClientError as err:
+          logger.error("Error in adding new bucket policy for %s", bucket)
+          logger.exception(err.response)
+          raise
+      else:
+        logger.error("Error occurred getting bucket policy")
+        logger.exception(ce.response)
+        raise
+
+    try:
+      policy = policy_response['Policy']
+
+      # convert policy from string to json
+      policy = json.loads(policy)
+
+      found_policy = False
+      # loop through to see if policy already exists
+      for index, statement in enumerate(policy['Statement']):
+        # check by sid (policy name)
+        if 'Sid' in statement and statement['Sid'] == policy_name:
+          # if exists, replace it
+          logger.info("Found Sid, updating.")
+          policy['Statement'][index] = bucket_policy
+          found_policy = True
+
+      if not found_policy:
+        logger.info("Statement not found, adding.")
+        # add new policy to list if not found
+        policy['Statement'].append(bucket_policy)
+
+      # Convert the policy from JSON dict to string
+      policy = json.dumps(policy)
+
+      # Set the new policy
+      _s3.put_bucket_policy(Bucket=bucket, Policy=policy)
+    except ClientError as ce:
+      logger.error("Error in adding new bucket policy for %s", bucket)
+      logger.exception(ce.response)
+      raise
+
+  @staticmethod
+  def send_sns_message(topic='', topic_arn='', message_string='', subject='AWS Notification Message'):
+    """
+    Sends a message to an AWS Simple Notification Service (SNS) topic.
+    This function publishes a message to the specified SNS topic using the AWS boto3 client.
+    Args:
+      topic (str, optional): The name of the SNS topic (used for logging purposes only).
+      topic_arn (str, optional): The Amazon Resource Name (ARN) of the SNS topic.
+      message_string (str, optional): The content of the message to be published.
+      subject (str, optional): The subject of the notification. Defaults to 'AWS Notification Message'.
+    Returns:
+      str: The MessageId of the published message if successful.
+    Raises:
+      Exception: If there is an error publishing the message to the SNS topic.
+    """
+    # Connect to AWS Simple Notification Service
+    sns_client = boto3.client('sns')
+    logger.info('Sending notification to %s',topic)
+
+    try:
+      response = sns_client.publish(
+          Subject=f'{subject}',
+          Message= f'{message_string}',
+          TopicArn = topic_arn
+      )['MessageId']
+    except:
+      logger.exception('Failed to send notification for topic %s', topic_arn)
+      raise
+
+    return response
+
+  @staticmethod
+  def StackSynthesizer(env=""):
+    """
+    Creates and configures a DefaultStackSynthesizer with environment-specific parameters.
+    This function creates a DefaultStackSynthesizer with the appropriate naming conventions
+    for various AWS resources and IAM roles based on the provided environment.
+    Args:
+      env (str, optional): The environment identifier to use in resource naming.
+        If empty, "project" will be used as the default. Defaults to "".
+    Returns:
+      DefaultStackSynthesizer: A configured stack synthesizer for CDK deployments.
+    Example:
+      >>> synthesizer = StackSynthesizer("dev")
+      >>> # This would create a synthesizer with "dev" qualifiers
+      >>> synthesizer = StackSynthesizer()
+      >>> # This would create a synthesizer with "project" as the default
+    """
+    # pylint: disable=f-string-without-interpolation
+    iam_arn=f"arn:${{AWS::Partition}}:iam::${{AWS::AccountId}}:role/project"
+    if len(env) > 0:
+      project_env=f"project-{env}"
+    else:
+      env="project"
+      project_env="project"
+
+    logger.info("env: %s, project_env %s", env, project_env)
+    synthesizer=DefaultStackSynthesizer(
+      qualifier=env,
+      file_assets_bucket_name=f"cdktoolkit-stagingbucket-{env}",
+      image_assets_repository_name="cdk-{project_env}-container-assets",
+      deploy_role_arn=f"{iam_arn}/{project_env}-ped-cdk-deploy-role",
+      file_asset_publishing_role_arn=f"{iam_arn}/{project_env}-ped-cdk-file-publishing-role",
+      image_asset_publishing_role_arn=f"{iam_arn}/{project_env}-ped-cdk-image-publishing-role",
+      cloud_formation_execution_role=f"{iam_arn}/{project_env}-ped-cdk-cfn-exec-role",
+      lookup_role_arn=f"{iam_arn}/{project_env}-ped-cdk-lookup-role",
+      bootstrap_stack_version_ssm_parameter=f"/cdk-bootstrap/{project_env}/version",
+      generate_bootstrap_version_rule=True,
+      )
+    return synthesizer
+
+  @staticmethod
+  def set_sns_publish_policy(topic, principal, policy_name):
+    """
+    Add a policy statement to an SNS topic to allow a specific principal to publish to it.
+    This function retrieves the existing policy for an SNS topic, checks if a policy with the
+    specified name already exists, and if not, adds a new policy statement that allows the specified
+    principal to publish messages to the topic.
+    Args:
+      topic (str): The ARN of the SNS topic to modify.
+      principal (dict): The AWS principal to grant publish permissions to (in proper AWS policy format).
+      policy_name (str): A unique identifier (Sid) for the policy statement.
+    Raises:
+      ClientError: If the AWS API call fails.
+      Exception: If any other error occurs during execution.
+    Returns:
+      None
+    Example:
+      set_sns_publish_policy(
+        "arn:aws:sns:us-east-1:123456789012:my-topic",
+        {"Service": "lambda.amazonaws.com"},
+        "AllowLambdaPublish"
+    """
+    topic_name=topic.split(":")[-1]
+    logger.debug("Set policy for %s on %s", principal, topic_name)
+    sns_client=boto3.client('sns')
+    # create polcy statement to allow publish
+
+    sns_update_statement = {
+                            "Sid": policy_name,
+                            "Effect": "Allow",
+                            "Principal": principal,
+                            "Action": ["SNS:Publish"],
+                            "Resource": topic
+                           }
+    logger.debug("Try to add policy statement %s",json.dumps(sns_update_statement))
+    try:
+      existing_policy_attributes= sns_client.get_topic_attributes(TopicArn=topic)['Attributes']
+      policy_dict = json.loads(existing_policy_attributes['Policy'])
+      logger.debug("Search Existing Policy Statement for Sid: %s", {policy_name})
+      if not list(filter(lambda item: item['Sid'] == policy_name, policy_dict['Statement'])):
+        logger.debug("Try to append updated statement):\n %s", sns_update_statement)
+        policy_dict['Statement'].append(sns_update_statement)
+
+        full_statement={
+          'Version': '2008-10-17',
+          'Id': '__new_policy_ID',
+          'Statement': policy_dict['Statement']
+        }
+        sns_client.set_topic_attributes(
+                                        TopicArn=topic,
+                                        AttributeName='Policy',
+                                        AttributeValue=json.dumps(full_statement)
+                                        )
+
+    except ClientError as ce:
+      logger.exception(ce)
+      raise
+    except Exception as ex:
+      logger.exception(ex)
+      raise
+
+  @staticmethod
+  def get_params_by_path(path):
+    """
+    Retrieves all parameters under a specified path from AWS Systems Manager Parameter Store.
+    This function recursively fetches parameters from the Parameter Store using the provided path.
+    It handles pagination by making multiple API calls if necessary.
+    Args:
+      path (str): The hierarchical path to retrieve parameters from (e.g., '/app/dev/').
+            Must begin with a forward slash (/).
+    Returns:
+      dict: A dictionary where keys are parameter names (full paths) and values are
+          the corresponding parameter values.
+    Raises:
+      ClientError: If there is an error with the AWS API call.
+      Exception: If any other error occurs during execution.
+    Note:
+      This function requires boto3 and proper AWS credentials/configuration.
+      It uses the AWS_REGION environment variable to determine the region.
+    """
+    ssm_client = boto3.client("ssm",os.environ.get('AWS_REGION') )
+
+    # use to build dictionary of currently deployed parameters
+    current_params = {}
+    next_token = ""
+
+    # while loop is required as boto3 returns limited list. need to keep looping through with next_token
+    while True:
+      try:
+        if len(next_token) != 0:
+          response = ssm_client.get_parameters_by_path(Path=path, Recursive=True, NextToken=next_token)
+        else:
+          response = ssm_client.get_parameters_by_path(Path=path, Recursive=True)
+
+        for parameter in response['Parameters']:
+          if 'Name' in parameter and 'Value' in parameter:
+            current_params[parameter['Name']] = parameter['Value']
+
+        if 'NextToken' not in response:
+          break
+        next_token = response['NextToken']
+
+      except ClientError as ce:
+        logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+        logger.error ("ClientError: %s",ce.response)
+      except Exception as ex:
+        logger.exception(ex)
+        raise
+
+    return current_params
+
+  @staticmethod
+  def list_with_versioning(bucket, prefix=None):
+    """
+    Lists the objects in a bucket, optionally filtered by a prefix.
+    :param bucket: The bucket to query. This is a Boto3 Bucket resource.
+    :param prefix: When specified, only objects that start with this prefix are listed.
+    :return: The list of objects.
+    """
+    try:
+      if not prefix:
+        objects = list(bucket.object_versions.all())
+      else:
+        objects = list(bucket.object_versions.filter(Prefix=prefix))
+      logger.debug("Got objects %s from bucket '%s'",
+                  [o.key for o in objects],
+                  bucket.name
+                  )
+    except ClientError:
+      logger.exception("Couldn't get objects for bucket '%s'.", bucket.name)
+      raise
+
+    return objects
+
+  @staticmethod
+  def permanently_delete_object(bucket, object_key):
+    """
+    Permanently deletes a versioned object by deleting all of its versions.
+    :param bucket: The bucket that contains the object.
+    :param object_key: The object to delete.
+    """
+    try:
+      if object_key is not None:
+        bucket.object_versions.filter(Prefix=object_key).delete()
+        logger.info("Permanently deleted all versions of object %s.", object_key)
+    except ClientError:
+      logger.exception("Couldn't delete all versions of %s.", object_key)
+      raise
+
+  @staticmethod
+  def is_target_ready(promote_ready=None, target_env=None):
+    '''
+    As a result of comon configuration stacks, there is a need to configure a stack for deployment
+    when not all members of the stack may be ready to progress to next env
+    To alleviate this, create a list of the env ready to receive said stack member
+    defaults to true, as everything is ready to promote
+    Inputs:
+      promote_ready: [] list of env ready to receive stack member
+      target_env: string representing the target of the promotion
+    Return:
+      true, if can be deployed (default)
+      false, target_env is not a member of promote_ready
+    '''
+    approved_to_deploy = True
+    logger.info("Check for restrictions on target_env %s", target_env)
+
+    if promote_ready is None:
+      logger.info("No restrictions on target, promote to %s", target_env)
+    elif not isinstance(promote_ready, list):
+      logger.error("promote_ready (%s) is not a list", promote_ready)
+      approved_to_deploy = False
+    elif not target_env in promote_ready:
+      logger.info("target_env %s is not a member of promote_ready to %s", target_env, promote_ready)
+      approved_to_deploy = False
+    else:
+      logger.info("target_env %s is a member of promote_ready to %s", target_env, promote_ready)
+
+    return approved_to_deploy
+
+
+  @staticmethod
+  def is_external_resource_ready(config, app_env, stack_name, pattern, resource_type):
+    """
+    Determines if an external resource is ready for promotion based on configuration.
+    This function evaluates the readiness of external resources by checking their
+    'ready_for_promote' flags against the target environment.
+    Args:
+      config (dict): The configuration dictionary containing resource definitions
+      app_env (str): The target environment (e.g., 'dev', 'test', 'prod')
+      stack_name (str): The name of the CloudFormation stack
+      pattern (str): Regular expression pattern to match resource names
+      resource_type (str): AWS resource type (e.g., 'AWS::Lambda::Function')
+    Returns:
+      bool: True if all matching resources are ready for promotion to the target
+          environment, or if no matching resources are found; False otherwise
+    Supported resource types:
+      - AWS::Batch::JobDefinition
+      - AWS::StepFunctions::StateMachine
+      - AWS::Lambda::Function
+    """
+    rfp_key = 'ready_for_promote'
+    flag = True
+
+    if resource_type == "AWS::Batch::JobDefinition":
+      key = "jobs"
+    elif resource_type == "AWS::StepFunctions::StateMachine":
+      key = "stepfunctions"
+    elif resource_type == "AWS::Lambda::Function":
+      key = "lambdas"
+    else:
+      return flag
+
+    for resource in config[stack_name][key]:
+      if 'name' not in resource:
+        break
+      if re.match(pattern, resource['name'].replace("-", "")):
+        if rfp_key not in resource:
+          break
+        if not CommonUtil.is_target_ready(promote_ready=resource[rfp_key], target_env=app_env):
+          return False
+
+    return flag
+
+  @staticmethod
+  def get_ec2_by_name(hostname):
+    """
+    Retrieves the EC2 instance ID associated with a specific hostname.
+    This function queries AWS EC2 to find an instance with a tag 'project_hostname'
+    matching the provided hostname. If found, it returns the instance ID.
+    Args:
+      hostname (str): The hostname to search for in EC2 instance tags.
+    Returns:
+      str: The EC2 instance ID if found, or an empty string if no matching
+         instance is found or an error occurs.
+    Raises:
+      Exception: Re-raises any non-ClientError exceptions that occur during processing.
+    Logs:
+      - INFO: Logs the lookup process and success results
+      - ERROR: Logs AWS ClientErrors with error code details or other exceptions
+    """
+    instance_id = ""
+    ec2_client = boto3.client('ec2')
+    try:
+      logger.info("Looking up Instance ID by hostname %s", hostname)
+      response = ec2_client.describe_instances(
+        Filters=[
+          {
+              'Name': 'tag:project_hostname',
+              'Values': [hostname]
+          }
+        ]
+      )
+
+      if response:
+        for res in response['Reservations']:
+          for instance in res['Instances']:
+            instance_id = instance['InstanceId']
+            logger.info("Instance ID is %s", instance['InstanceId'])
+
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.error(ex)
+      raise
+
+    return instance_id
+
+  @staticmethod
+  def get_loadbalancer_by_name(lb_name):
+    """
+    Search for an AWS LoadBalancer by name and return its ARN.
+    This function uses the AWS boto3 client to query ELBv2 (Elastic Load Balancing) service
+    to find a load balancer matching the given name.
+    Args:
+      lb_name (str): The name of the load balancer to search for.
+    Returns:
+      str: The ARN (Amazon Resource Name) of the found load balancer.
+         Returns an empty string if no matching load balancer is found.
+    Raises:
+      Exception: Any unexpected exceptions not related to AWS ClientError are re-raised.
+    Note:
+      AWS ClientErrors are caught and logged but not re-raised.
+    """
+    elb_client = boto3.client("elbv2")
+
+    try:
+      elb_response = elb_client.describe_load_balancers(Names=[lb_name])
+
+      for lb in elb_response['LoadBalancers']:
+        if lb['LoadBalancerName'] == lb_name:
+          logger.info("Found load balancer ARN: %s", lb['LoadBalancerArn'])
+          return lb['LoadBalancerArn']
+
+    except ClientError as ce:
+      logger.error("ClientError Code: %s",ce.response['Error']['Code'])
+      logger.error("ClientError: %s",ce.response)
+    except Exception as ex:
+      logger.error(ex)
+      raise
+
+    logger.info("Could not find load balancer matching %s", lb_name)
+    return ""
+
+  @staticmethod
+  def handle_circular_dependency_arn(resource_type, config):
+    """
+    Handles circular dependency ARNs for specific AWS resource types.
+    This function generates a partial ARN string format to help resolve circular
+    dependencies in CloudFormation templates for certain AWS resources.
+    Args:
+      resource_type (str): The AWS resource type (e.g., 'AWS::StepFunctions::StateMachine')
+      config (dict): Configuration dictionary containing resource-specific settings
+    Returns:
+      str: A formatted string representing part of the ARN for the specified resource type.
+        For Step Functions, returns 'stateMachine:{name}' format.
+        Returns empty string if the resource type is not supported or if required
+        configuration is missing.
+    Raises:
+      None: Errors are logged but not raised.
+    """
+    rtn_string=""
+    if resource_type == "AWS::StepFunctions::StateMachine":
+      if 'stepfunctions' not in config or not config['stepfunctions']:
+        logger.error("The 'stepfunctions' key is missing or empty in the config dictionary.")
+      cfg = config['stepfunctions']
+      key = next(iter(cfg))
+      if 'name' in cfg[key]:
+        sfn_name = cfg[key]['name']
+        rtn_string = f"stateMachine:{sfn_name}"
+
+    return rtn_string
 
