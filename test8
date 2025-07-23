@@ -92,5 +92,17 @@ SELECT
 FROM instance_usage
 ORDER BY usage_count DESC;
 
-
+SELECT 
+    eventTime,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.jobName') as job_name,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.jobQueue') as job_queue,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.jobDefinition') as job_definition,
+    userIdentity.userName,
+    userIdentity.type as user_type
+FROM cloudtrial_audit_logging_prod
+WHERE eventSource = 'batch.amazonaws.com'
+    AND eventName = 'SubmitJob'
+    AND eventTime >= CURRENT_DATE - INTERVAL '7' DAY
+ORDER BY eventTime DESC
+LIMIT 100;
 
