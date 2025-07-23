@@ -1,483 +1,96 @@
-Here's the comprehensive solution approach for AWS Batch runnable state issues:
-1. Capacity Analysis & Scaling (Most Critical)
-Check Current Limits:
-
-
-bash
-# Check your EC2 service quotas
-aws service-quotas get-service-quota --service-code ec2 --quota-code L-34B43A08  # Running On-Demand instances
-aws service-quotas get-service-quota --service-code ec2 --quota-code L-417A185B  # vCPUs for Spot instances
-Immediate Actions:
-* Increase maxvCpus in your compute environments to match your actual needs
-* Request EC2 service quota increases if hitting limits
-* Enable multiple AZs in your compute environment for better instance availability
-2. Compute Environment Optimization
-Multi-Environment Strategy:
-
-
-Memory-Optimized Env: 
-- Instance types: r5.*, r6i.*, x1.*
-- maxvCpus: 500
-- For high-memory jobs
-
-CPU-Optimized Env:
-- Instance types: c5.*, c6i.*, c7i.*  
-- maxvCpus: 1000
-- For compute-intensive jobs
-
-General Purpose Env:
-- Instance types: m5.*, m6i.*, optimal
-- maxvCpus: 2000  
-- For standard workloads
-Instance Type Flexibility: Instead of restricting to specific families, use broader selections:
-
-
-json
-"instanceTypes": ["m5.large", "m5.xlarge", "m6i.large", "m6i.xlarge", "c5.large", "c5.xlarge"]
-3. Mixed Instance Strategy
-Spot + On-Demand Mix:
-
-
-json
-{
-  "type": "EC2",
-  "allocationStrategy": "SPOT_CAPACITY_OPTIMIZED",
-  "bidPercentage": 80,
-  "instanceTypes": ["optimal"],
-  "spotIamFleetRequestRole": "arn:aws:iam::account:role/aws-ec2-spot-fleet-role"
-}
-Create separate compute environments:
-* 70% Spot instances (cost-effective)
-* 30% On-Demand (guaranteed capacity)
-4. Job Definition Right-Sizing
-Resource Optimization:
-
-
-json
-{
-  "vcpus": 2,           // Don't over-provision
-  "memory": 4096,       // Match actual requirements
-  "jobRoleArn": "...",
-  "requiresAttributes": [
-    {
-      "name": "ec2InstanceType",
-      "value": "m5.large,m5.xlarge,c5.large"  // Multiple options
-    }
-  ]
-}
-5. Multi-AZ and Region Strategy
-Availability Zones:
-
-
-json
-"subnets": [
-  "subnet-12345",  // us-east-1a
-  "subnet-67890",  // us-east-1b  
-  "subnet-abcdef"  // us-east-1c
-]
-Consider Multiple Regions: For critical workloads, deploy Batch in multiple regions with cross-region job submission logic.
-6. Monitoring & Alerting
-Key CloudWatch Metrics:
-
-
-bash
-# Set alarms for:
-- RunnableJobs > 5 for 5 minutes
-- AvailableCapacity < 10% 
-- SubmittedJobs vs CompletedJobs ratio
-7. Implementation Priority
-Week 1 - Quick Wins:
-1. Increase maxvCpus to 3-5x current usage
-2. Add "optimal" to instance types
-3. Enable multiple AZs
-4. Request service quota increases
-Week 2 - Architecture:
-1. Implement Spot/On-Demand mix
-2. Create separate compute environments by workload type
-3. Set up monitoring dashboards
-Week 3 - Optimization:
-1. Analyze job patterns and right-size resource requests
-2. Implement auto-scaling job submission logic
-3. Fine-tune instance type selections
-8. Emergency Workaround
-Immediate Relief:
-
-
-bash
-# Temporarily increase desired capacity manually
-aws batch update-compute-environment \
-  --compute-environment my-env \
-  --compute-resources desiredvCpus=200
-Job Distribution: Spread jobs across multiple compute environments instead of routing everything through one environment.
-Root Cause Summary
-The runnable state is almost always caused by:
-1. Insufficient maxvCpus (80% of cases)
-2. EC2 service quotas (15% of cases)
-3. Instance availability (5% of cases)
-Start with capacity scaling, then optimize architecture. The multiple queue strategy you mentioned earlier is just one small piece of the overall solution.
-
-
-Retry
-Claude does not have the ability to run the code it generates yet.
-B
-is this works, fair share scheduling?
-Edit
-
-No, AWS Batch does NOT use fair share scheduling. AWS Batch uses priority-based scheduling, which is quite different. Let me explain the distinction and implications:
-AWS Batch Scheduling Model
-Current System: Priority-Based
-* Jobs are scheduled strictly by queue priority (higher number = higher priority)
-* Within the same priority, jobs are scheduled FIFO (first in, first out)
-* No automatic resource sharing or user/group quotas
-
-
-Priority 100 Queue → All jobs here run before any lower priority jobs
-Priority 50 Queue  → Only gets resources after Priority 100 is empty
-Priority 10 Queue  → Only gets resources after Priority 50 is empty
-Fair Share Scheduling (What AWS Batch Lacks)
-Fair share scheduling would:
-* Allocate resources proportionally between users/groups
-* Prevent resource monopolization by any single user/project
-* Dynamically adjust priorities based on historical usage
-* Guarantee minimum resource allocation to each share
-Why This Matters for Your Runnable State Issue
-The Problem with Priority-Only:
-
-
-Scenario:
-- Team A submits 100 high-priority jobs
-- Team B submits 10 medium-priority jobs  
-- Team C submits 5 low-priority jobs
-
-Result: Team B and C jobs stay runnable until ALL of Team A's jobs complete
-With Fair Share (if AWS had it):
-
-
-Team A: 50% share → Gets 50% of resources regardless of job count
-Team B: 30% share → Guaranteed 30% of resources
-Team C: 20% share → Guaranteed 20% of resources
-Current Workarounds for Fair-Share-Like Behavior
-1. Multiple Compute Environments:
-
-
-Team-A-Environment: maxvCpus = 500
-Team-B-Environment: maxvCpus = 300  
-Team-C-Environment: maxvCpus = 200
-Each team gets dedicated capacity, but this is resource isolation, not true fair share.
-2. External Orchestration: Use tools like Apache Airflow or custom Lambda functions to:
-* Track resource usage per team/project
-* Dynamically adjust job submission rates
-* Implement custom fair share logic
-3. Time-Based Scheduling:
-* Different teams submit jobs during different time windows
-* Use scheduled Lambda functions to enable/disable job queues
-What You Can Do Today
-Option 1: Resource Quotas by Team
-
-
-compute-env-team-a: maxvCpus = 400
-compute-env-team-b: maxvCpus = 300
-compute-env-shared: maxvCpus = 300
-Option 2: Application-Level Fair Share Implement logic in your job submission system:
-
-
-python
-def submit_job_with_fair_share():
-    current_usage = get_team_resource_usage()
-    if current_usage < team_quota:
-        submit_job()
-    else:
-        queue_for_later()
-Option 3: Third-Party Solutions Consider container orchestrators with fair share:
-* Amazon EKS with resource quotas and priority classes
-* AWS ParallelCluster with Slurm scheduler (has fair share)
-Bottom Line
-Your runnable state issue is likely capacity-related, not scheduling fairness-related. AWS Batch's priority system is working as designed - it just needs more compute capacity to schedule waiting jobs.
-If you need true fair share scheduling, you'll need to either:
-1. Implement it at the application layer
-2. Use a different compute platform (EKS, ParallelCluster)
-3. Wait for AWS to potentially add fair share to Batch (no timeline announced)
-The priority queues help with job ordering but don't solve the fundamental capacity problem.
-
-
-Retry
-Claude does not have the ability to run the code it generates yet.
-AWS HPC Blog Introducing fair-share scheduling for AWS Batch by Christian Kniep on 09 NOV 2021 in Announcements, AWS Batch, High Performance Computing, Launch Permalink Share Today we’re introducing fair-share scheduling, a new way to manage many users or workloads in a single AWS Batch job queue,
-pasted
-
-B
-
-Edit
-
-You're absolutely right! I apologize for the outdated information. AWS Batch DOES support fair-share scheduling as of November 2021. This is a significant feature that directly addresses your runnable state issues. Let me explain how this can solve your problem:
-Fair-Share Scheduling in AWS Batch
-What It Provides:
-* Proportional resource allocation between different workloads/users
-* Prevention of resource monopolization
-* Guaranteed minimum capacity for each share identifier
-* Priority scheduling within shares
-How This Fixes Your Runnable State Problem
-Before Fair-Share:
-
-
-Team A submits 100 jobs → Takes all capacity
-Team B & C jobs → Stuck in RUNNABLE state indefinitely
-With Fair-Share:
-
-
-Team A: Gets their allocated share (e.g., 50%)
-Team B: Gets their allocated share (e.g., 30%) 
-Team C: Gets their allocated share (e.g., 20%)
-All teams run concurrently, no more indefinite waiting
-Implementation Steps
-1. Create a Scheduling Policy:
-
-
-json
-{
-  "name": "multi-team-fair-share",
-  "fairsharePolicy": {
-    "shareDecaySeconds": 3600,
-    "computeReservation": 75,
-    "shareDistribution": [
-      {
-        "shareIdentifier": "team-critical",
-        "weightFactor": 2.0
-      },
-      {
-        "shareIdentifier": "team-batch",
-        "weightFactor": 1.0
-      },
-      {
-        "shareIdentifier": "team-research", 
-        "weightFactor": 1.0
-      }
-    ]
-  }
-}
-2. Attach Policy to Job Queue:
-
-
-bash
-aws batch create-job-queue \
-  --job-queue-name fair-share-queue \
-  --priority 100 \
-  --scheduling-policy-arn arn:aws:batch:region:account:scheduling-policy/multi-team-fair-share \
-  --compute-environment-order order=1,computeEnvironment=my-compute-env
-3. Submit Jobs with Share Identifiers:
-
-
-json
-{
-  "jobName": "critical-job-1",
-  "jobQueue": "fair-share-queue",
-  "shareIdentifier": "team-critical",
-  "schedulingPriority": 100,
-  "jobDefinition": "my-job-def"
-}
-Key Configuration Options
-Weight Factors:
-* team-critical: 2.0 → Gets 2x resources compared to others
-* team-batch: 1.0 → Standard allocation
-* team-research: 1.0 → Standard allocation
-Compute Reservation (75%):
-* Reserves 25% for each of the 3 teams
-* Remaining 25% can be used by any team when others are idle
-Share Decay (3600 seconds):
-* Considers resource usage over the last hour for fairness calculations
-* Prevents short bursts from affecting long-term fairness
-Advanced Features
-Priority Within Shares:
-
-
-json
-{
-  "shareIdentifier": "team-critical",
-  "schedulingPriority": 100  // Higher priority within the team's allocation
-}
-IAM-Based Access Control:
-
-
-json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "batch:SubmitJob",
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "batch:ShareIdentifier": "team-critical"
-        }
-      }
-    }
-  ]
-}
-Real-World Example
-Scenario:
-* 1000 vCPU compute environment
-* 75% compute reservation
-* 3 teams with weight factors: 2, 1, 1
-Resource Allocation:
-
-
-Team Critical: 250 vCPUs reserved + share of 250 unreserved = up to 375 vCPUs
-Team Batch:    187.5 vCPUs reserved + share of 250 unreserved = up to 312.5 vCPUs  
-Team Research: 187.5 vCPUs reserved + share of 250 unreserved = up to 312.5 vCPUs
-Migration Strategy
-Phase 1: Enable Fair-Share
-1. Create scheduling policy with equal weights (1.0) for all teams
-2. Update job submission to include shareIdentifier
-3. Monitor resource distribution
-Phase 2: Optimize Weights
-1. Analyze actual usage patterns
-2. Adjust weight factors based on business priorities
-3. Fine-tune compute reservation percentage
-Phase 3: Advanced Features
-1. Implement priority scheduling within teams
-2. Add IAM policies for share identifier access control
-3. Optimize shareDecaySeconds based on workload patterns
-This is likely the best solution for your runnable state issues if you have multiple teams or workload types competing for resources. Fair-share scheduling ensures everyone gets their fair allocation while preventing any single workload from monopolizing capacity.
-
-
-Retry
-Claude does not have the ability to run the code it generates yet.
-B
-what fairshare scheduling vs priority to job queue
-Edit
-
-Great question! These are two different scheduling mechanisms that can work together. Let me break down the key differences and how they interact:
-Fair-Share Scheduling vs Job Queue Priority
-Job Queue Priority (Traditional)
-What it does:
-* Controls which queue gets resources first
-* All jobs in higher priority queue run before lower priority queue jobs
-* Queue-level resource allocation
-Example:
-
-
-Queue A (Priority 100) → All jobs here run first
-Queue B (Priority 50)  → Only runs when Queue A is empty  
-Queue C (Priority 10)  → Only runs when Queue A & B are empty
-Fair-Share Scheduling (Within a Queue)
-What it does:
-* Controls resource allocation within a single queue
-* Multiple workloads share queue capacity proportionally
-* Share-identifier-level resource allocation
-Example:
-
-
-Single Queue with Fair-Share Policy:
-├── team-critical (weight 2.0) → Gets 50% of queue capacity
-├── team-batch (weight 1.0)    → Gets 25% of queue capacity  
-└── team-research (weight 1.0)  → Gets 25% of queue capacity
-How They Work Together
-Scenario 1: Queue Priority + Fair-Share
-
-
-Priority 100 Queue (Fair-Share Enabled)
-├── Production workload (weight 2.0)
-├── Staging workload (weight 1.0)
-└── Dev workload (weight 1.0)
-
-Priority 50 Queue (Fair-Share Enabled) 
-├── Team A (weight 1.0)
-├── Team B (weight 1.0)
-└── Team C (weight 1.0)
-
-Priority 10 Queue (FIFO)
-└── Batch processing jobs
-Resource Allocation:
-1. First: Priority 100 queue gets resources, split fairly between Production (50%), Staging (25%), Dev (25%)
-2. Second: Priority 50 queue gets remaining resources, split equally between teams
-3. Last: Priority 10 queue gets leftover resources, scheduled FIFO
-Scenario 2: Multiple Approaches
-Option A: Single Queue with Fair-Share
-
-
-One Queue (Priority 100) with Fair-Share:
-├── critical-workload (weight 3.0) → 50% share
-├── normal-workload (weight 2.0)   → 33% share
-└── batch-workload (weight 1.0)    → 17% share
-Option B: Multiple Priority Queues
-
-
-Critical Queue (Priority 100) → Gets all resources first
-Normal Queue (Priority 50)    → Gets resources when critical is idle
-Batch Queue (Priority 10)     → Gets resources when others are idle
-When to Use Which Approach
-Use Fair-Share Scheduling When:
-* Multiple teams/workloads need guaranteed resource access
-* You want concurrent execution of different workload types
-* Need to prevent resource monopolization
-* Want proportional resource allocation
-Use Queue Priority When:
-* You have strict precedence requirements (critical must finish before normal)
-* Need simple resource hierarchy
-* Different workloads have completely different SLAs
-Use Both Together When:
-* Complex organizational needs (departments + priority levels)
-* Multi-tier applications with fair-share within each tier
-Practical Recommendation for Your Use Case
-Based on your original problem (jobs stuck in runnable state), I'd recommend:
-Option 1: Single Queue with Fair-Share (Recommended)
-
-
-json
-{
-  "name": "unified-fair-share-policy",
-  "fairsharePolicy": {
-    "shareDecaySeconds": 3600,
-    "computeReservation": 80,
-    "shareDistribution": [
-      {
-        "shareIdentifier": "memory-intensive",
-        "weightFactor": 2.0
-      },
-      {
-        "shareIdentifier": "cpu-intensive", 
-        "weightFactor": 2.0
-      },
-      {
-        "shareIdentifier": "general-purpose",
-        "weightFactor": 1.0
-      }
-    ]
-  }
-}
-Benefits:
-* All workloads get concurrent access to resources
-* No jobs get completely blocked
-* Proportional allocation based on business needs
-* Simpler architecture (one queue vs multiple)
-Option 2: Hybrid Approach
-
-
-Critical Queue (Priority 100) + Fair-Share
-├── urgent-memory-jobs
-├── urgent-cpu-jobs  
-└── urgent-general-jobs
-
-Standard Queue (Priority 50) + Fair-Share
-├── memory-intensive
-├── cpu-intensive
-└── general-purpose
-Key Differences Summary
-Aspect	Queue Priority	Fair-Share Scheduling
-Scope	Between queues	Within a queue
-Resource Access	Sequential	Concurrent
-Starvation Risk	High (lower priority queues)	Low (guaranteed shares)
-Complexity	Simple	More complex
-Use Case	Strict hierarchy	Proportional sharing
-Bottom Line: Fair-share scheduling is likely better for solving your runnable state issues because it prevents resource starvation and ensures all workload types get their fair share of compute resources simultaneously.
-
-
-Retry
-Claude does not have the ability to run the code it generates yet.
-
-Claude can make mistakes. 
-Please double-check responses.
+Check Batch Job Instance Types
+Look for Batch Job Submissions with Instance Type Details:
+sqlSELECT 
+    eventTime,
+    eventName,
+    userIdentity.userName,
+    requestParameters,
+    responseElements
+FROM cloudtrial_audit_logging_prod
+WHERE eventSource = 'batch.amazonaws.com'
+    AND eventName IN ('SubmitJob', 'CreateJobQueue', 'CreateComputeEnvironment')
+    AND eventTime >= CURRENT_DATE - INTERVAL '30' DAY
+ORDER BY eventTime DESC;
+Extract Instance Type Information from Request Parameters:
+sqlSELECT 
+    eventTime,
+    eventName,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.computeEnvironmentName') as compute_env,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') as instance_type,
+    CASE 
+        WHEN JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') LIKE 'c%' 
+        THEN 'C-Series' 
+        ELSE 'Other' 
+    END as instance_family,
+    requestParameters
+FROM cloudtrial_audit_logging_prod
+WHERE eventSource = 'batch.amazonaws.com'
+    AND eventName = 'CreateComputeEnvironment'
+    AND eventTime >= CURRENT_DATE - INTERVAL '90' DAY
+ORDER BY eventTime DESC;
+Check for Any C-Series Instance Usage:
+sqlSELECT 
+    DATE(eventTime) as date,
+    eventName,
+    COUNT(*) as total_events,
+    COUNT(CASE 
+        WHEN requestParameters LIKE '%"c[0-9]%' 
+        OR requestParameters LIKE '%"c5%'
+        OR requestParameters LIKE '%"c6%' 
+        THEN 1 
+    END) as c_series_count
+FROM cloudtrial_audit_logging_prod
+WHERE eventSource = 'batch.amazonaws.com'
+    AND eventName IN ('CreateComputeEnvironment', 'UpdateComputeEnvironment')
+    AND eventTime >= CURRENT_DATE - INTERVAL '90' DAY
+GROUP BY DATE(eventTime), eventName
+ORDER BY date DESC;
+Alternative Approach - Check EC2 Instance Launches
+Since Batch uses EC2 instances under the hood, you can also check EC2 launch events:
+sqlSELECT 
+    eventTime,
+    eventName,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.instanceType') as instance_type,
+    JSON_EXTRACT_SCALAR(requestParameters, '$.imageId') as ami_id,
+    CASE 
+        WHEN JSON_EXTRACT_SCALAR(requestParameters, '$.instanceType') LIKE 'c%' 
+        THEN 'C-Series' 
+        ELSE 'Other' 
+    END as instance_family
+FROM cloudtrial_audit_logging_prod
+WHERE eventSource = 'ec2.amazonaws.com'
+    AND eventName = 'RunInstances'
+    AND (
+        requestParameters LIKE '%batch%' 
+        OR userAgent LIKE '%batch%'
+        OR JSON_EXTRACT_SCALAR(requestParameters, '$.tagSpecification') LIKE '%batch%'
+    )
+    AND eventTime >= CURRENT_DATE - INTERVAL '30' DAY
+ORDER BY eventTime DESC;
+Summary Query for Instance Type Distribution
+sqlWITH instance_usage AS (
+    SELECT 
+        JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') as instance_type,
+        COUNT(*) as usage_count
+    FROM cloudtrial_audit_logging_prod
+    WHERE eventSource = 'batch.amazonaws.com'
+        AND eventName = 'CreateComputeEnvironment'
+        AND eventTime >= CURRENT_DATE - INTERVAL '90' DAY
+        AND JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') IS NOT NULL
+    GROUP BY JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]')
+)
+SELECT 
+    instance_type,
+    usage_count,
+    CASE 
+        WHEN instance_type LIKE 'c%' THEN 'C-Series (Compute Optimized)'
+        WHEN instance_type LIKE 'm%' THEN 'M-Series (General Purpose)'
+        WHEN instance_type LIKE 'r%' THEN 'R-Series (Memory Optimized)'
+        WHEN instance_type LIKE 't%' THEN 'T-Series (Burstable)'
+        ELSE 'Other'
+    END as instance_family
+FROM instance_usage
+ORDER BY usage_count DESC;
 
 
 
