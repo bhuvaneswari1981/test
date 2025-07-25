@@ -1,57 +1,138 @@
-As a Configuration Manager
-
-I want to Operationalize the configuration and deployment of this lambda to such that the following envars are configured
-
-queue_name
-
-target_date
-
- So that Lambda Timeout should be set for 5 minutes and Lambda naming conventions shojld follow our standard naming convention for lambdas
-
- 
 import boto3
+import os
 from datetime import datetime, timezone
+import logging
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 def lambda_handler(event, context):
-    sqs_client = boto3.client('sqs', region_name='us-gov-west-1')
-    queue_url = 'https://sqs.us-gov-west-1.amazonaws.com/412819066487/project-ped-test-834-eligibility-plus-incoming.fifo'
-    target_date = datetime(2025, 7, 8, tzinfo=timezone.utc)  # Change to the desired date
-    target_date_str = target_date.strftime('%Y-%m-%d')
-
-    num_deleted = 0
-
-    while True:
-        messages = receive_messages(sqs_client, queue_url)
-        if not messages:
-            # No more messages to process
-            break
-
-        for message in messages:
-            receipt_handle = message['ReceiptHandle']
-            attributes = message.get('Attributes', {})
-            sent_timestamp_ms = int(attributes.get('SentTimestamp', 0))
-            sent_timestamp = datetime.fromtimestamp(sent_timestamp_ms / 1000.0, timezone.utc)
+    """
+    Lambda function to delete SQS messages sent on a specific target date.
+    
+    Environment Variables Required:
+    - QUEUE_NAME: The SQS queue name (not URL)
+    - TARGET_DATE: Target date in YYYY-MM-DD format
+    
+    Function Configuration:
+    - Timeout: 5 minutes (300 seconds)
+    - Memory: 128 MB (adjust as needed)
+    """
+    try:
+        # Get configuration from environment variables
+        queue_name = os.environ.get('QUEUE_NAME')
+        target_date_str = os.environ.get('TARGET_DATE')
+        
+        # Validate required environment variables
+        if not queue_name:
+            raise ValueError("QUEUE_NAME environment variable is required")
+        if not target_date_str:
+            raise ValueError("TARGET_DATE environment variable is required")
+        
+        # Validate target date format
+        try:
+            target_date = datetime.strptime(target_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        except ValueError as e:
+            raise ValueError(f"TARGET_DATE must be in YYYY-MM-DD format: {e}")
+        
+        logger.info(f"Starting message cleanup for queue: {queue_name}, target date: {target_date_str}")
+        
+        # Initialize SQS client
+        sqs_client = boto3.client('sqs', region_name='us-gov-west-1')
+        
+        # Construct queue URL from queue name
+        queue_url = f"https://sqs.us-gov-west-1.amazonaws.com/{get_account_id()}/{queue_name}"
+        
+        # Verify queue exists
+        try:
+            sqs_client.get_queue_attributes(QueueUrl=queue_url)
+        except sqs_client.exceptions.QueueDoesNotExist:
+            raise ValueError(f"Queue {queue_name} does not exist")
+        
+        num_deleted = 0
+        total_processed = 0
+        
+        while True:
+            # Check remaining execution time to avoid timeout
+            remaining_time = context.get_remaining_time_in_millis()
+            if remaining_time < 30000:  # Stop if less than 30 seconds remaining
+                logger.warning(f"Stopping execution due to timeout. Processed: {total_processed}, Deleted: {num_deleted}")
+                break
             
-            if sent_timestamp.strftime('%Y-%m-%d') == target_date_str:
-                sqs_client.delete_message(
-                    QueueUrl=queue_url,
-                    ReceiptHandle=receipt_handle
-                )
-                print(f"Deleted message sent at {sent_timestamp}")
-                num_deleted += 1
-
-    return {
-        "statusCode": 200,
-        "body": f"Deleted {num_deleted} messages sent on {target_date_str}"
-    }
+            messages = receive_messages(sqs_client, queue_url)
+            if not messages:
+                logger.info("No more messages to process")
+                break
+            
+            total_processed += len(messages)
+            
+            for message in messages:
+                receipt_handle = message['ReceiptHandle']
+                attributes = message.get('Attributes', {})
+                sent_timestamp_ms = int(attributes.get('SentTimestamp', 0))
+                sent_timestamp = datetime.fromtimestamp(sent_timestamp_ms / 1000.0, timezone.utc)
+                
+                if sent_timestamp.strftime('%Y-%m-%d') == target_date_str:
+                    try:
+                        sqs_client.delete_message(
+                            QueueUrl=queue_url,
+                            ReceiptHandle=receipt_handle
+                        )
+                        logger.info(f"Deleted message sent at {sent_timestamp}")
+                        num_deleted += 1
+                    except Exception as e:
+                        logger.error(f"Failed to delete message: {e}")
+        
+        result = {
+            "statusCode": 200,
+            "body": {
+                "message": f"Cleanup completed for {target_date_str}",
+                "deleted_count": num_deleted,
+                "total_processed": total_processed,
+                "queue_name": queue_name
+            }
+        }
+        
+        logger.info(f"Cleanup completed. Deleted: {num_deleted}, Processed: {total_processed}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Lambda execution failed: {str(e)}")
+        return {
+            "statusCode": 500,
+            "body": {
+                "error": str(e),
+                "message": "Lambda execution failed"
+            }
+        }
 
 def receive_messages(sqs_client, queue_url):
-    response = sqs_client.receive_message(
-        QueueUrl=queue_url,
-        MaxNumberOfMessages=10,  # SQS allows a maximum of 10 messages per request
-        VisibilityTimeout=30,    # Set visibility timeout as needed
-        WaitTimeSeconds=0,       # Poll immediately
-        AttributeNames=['All']   # Include all attributes, including timestamps
-    )
-    return response.get('Messages', [])
+    """
+    Receive messages from SQS queue with proper error handling.
+    """
+    try:
+        response = sqs_client.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=10,  # SQS allows a maximum of 10 messages per request
+            VisibilityTimeout=30,    # Set visibility timeout as needed
+            WaitTimeSeconds=0,       # Poll immediately
+            AttributeNames=['All']   # Include all attributes, including timestamps
+        )
+        return response.get('Messages', [])
+    except Exception as e:
+        logger.error(f"Failed to receive messages: {e}")
+        return []
+
+def get_account_id():
+    """
+    Get AWS account ID from STS service.
+    """
+    try:
+        sts_client = boto3.client('sts')
+        return sts_client.get_caller_identity()['Account']
+    except Exception as e:
+        logger.error(f"Failed to get account ID: {e}")
+        # Fallback to hardcoded value if needed
+        return "697988999999"  # Replace with your actual account ID
 
