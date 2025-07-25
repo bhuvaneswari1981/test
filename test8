@@ -1,108 +1,46 @@
-Check Batch Job Instance Types
-Look for Batch Job Submissions with Instance Type Details:
-sqlSELECT 
-    eventTime,
-    eventName,
-    userIdentity.userName,
-    requestParameters,
-    responseElements
-FROM cloudtrial_audit_logging_prod
-WHERE eventSource = 'batch.amazonaws.com'
-    AND eventName IN ('SubmitJob', 'CreateJobQueue', 'CreateComputeEnvironment')
-    AND eventTime >= CURRENT_DATE - INTERVAL '30' DAY
-ORDER BY eventTime DESC;
-Extract Instance Type Information from Request Parameters:
-sqlSELECT 
-    eventTime,
-    eventName,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.computeEnvironmentName') as compute_env,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') as instance_type,
-    CASE 
-        WHEN JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') LIKE 'c%' 
-        THEN 'C-Series' 
-        ELSE 'Other' 
-    END as instance_family,
-    requestParameters
-FROM cloudtrial_audit_logging_prod
-WHERE eventSource = 'batch.amazonaws.com'
-    AND eventName = 'CreateComputeEnvironment'
-    AND eventTime >= CURRENT_DATE - INTERVAL '90' DAY
-ORDER BY eventTime DESC;
-Check for Any C-Series Instance Usage:
-sqlSELECT 
-    DATE(eventTime) as date,
-    eventName,
-    COUNT(*) as total_events,
-    COUNT(CASE 
-        WHEN requestParameters LIKE '%"c[0-9]%' 
-        OR requestParameters LIKE '%"c5%'
-        OR requestParameters LIKE '%"c6%' 
-        THEN 1 
-    END) as c_series_count
-FROM cloudtrial_audit_logging_prod
-WHERE eventSource = 'batch.amazonaws.com'
-    AND eventName IN ('CreateComputeEnvironment', 'UpdateComputeEnvironment')
-    AND eventTime >= CURRENT_DATE - INTERVAL '90' DAY
-GROUP BY DATE(eventTime), eventName
-ORDER BY date DESC;
-Alternative Approach - Check EC2 Instance Launches
-Since Batch uses EC2 instances under the hood, you can also check EC2 launch events:
-sqlSELECT 
-    eventTime,
-    eventName,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.instanceType') as instance_type,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.imageId') as ami_id,
-    CASE 
-        WHEN JSON_EXTRACT_SCALAR(requestParameters, '$.instanceType') LIKE 'c%' 
-        THEN 'C-Series' 
-        ELSE 'Other' 
-    END as instance_family
-FROM cloudtrial_audit_logging_prod
-WHERE eventSource = 'ec2.amazonaws.com'
-    AND eventName = 'RunInstances'
-    AND (
-        requestParameters LIKE '%batch%' 
-        OR userAgent LIKE '%batch%'
-        OR JSON_EXTRACT_SCALAR(requestParameters, '$.tagSpecification') LIKE '%batch%'
-    )
-    AND eventTime >= CURRENT_DATE - INTERVAL '30' DAY
-ORDER BY eventTime DESC;
-Summary Query for Instance Type Distribution
-sqlWITH instance_usage AS (
-    SELECT 
-        JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') as instance_type,
-        COUNT(*) as usage_count
-    FROM cloudtrial_audit_logging_prod
-    WHERE eventSource = 'batch.amazonaws.com'
-        AND eventName = 'CreateComputeEnvironment'
-        AND eventTime >= CURRENT_DATE - INTERVAL '90' DAY
-        AND JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]') IS NOT NULL
-    GROUP BY JSON_EXTRACT_SCALAR(requestParameters, '$.computeResources.instanceTypes[0]')
-)
-SELECT 
-    instance_type,
-    usage_count,
-    CASE 
-        WHEN instance_type LIKE 'c%' THEN 'C-Series (Compute Optimized)'
-        WHEN instance_type LIKE 'm%' THEN 'M-Series (General Purpose)'
-        WHEN instance_type LIKE 'r%' THEN 'R-Series (Memory Optimized)'
-        WHEN instance_type LIKE 't%' THEN 'T-Series (Burstable)'
-        ELSE 'Other'
-    END as instance_family
-FROM instance_usage
-ORDER BY usage_count DESC;
+import boto3
+from datetime import datetime, timezone
 
-SELECT 
-    eventTime,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.jobName') as job_name,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.jobQueue') as job_queue,
-    JSON_EXTRACT_SCALAR(requestParameters, '$.jobDefinition') as job_definition,
-    userIdentity.userName,
-    userIdentity.type as user_type
-FROM cloudtrial_audit_logging_prod
-WHERE eventSource = 'batch.amazonaws.com'
-    AND eventName = 'SubmitJob'
-    AND eventTime >= CURRENT_DATE - INTERVAL '7' DAY
-ORDER BY eventTime DESC
-LIMIT 100;
+def lambda_handler(event, context):
+    sqs_client = boto3.client('sqs', region_name='us-gov-west-1')
+    queue_url = 'https://sqs.us-gov-west-1.amazonaws.com/412819066487/project-ped-test-834-eligibility-plus-incoming.fifo'
+    target_date = datetime(2025, 7, 8, tzinfo=timezone.utc)  # Change to the desired date
+    target_date_str = target_date.strftime('%Y-%m-%d')
+
+    num_deleted = 0
+
+    while True:
+        messages = receive_messages(sqs_client, queue_url)
+        if not messages:
+            # No more messages to process
+            break
+
+        for message in messages:
+            receipt_handle = message['ReceiptHandle']
+            attributes = message.get('Attributes', {})
+            sent_timestamp_ms = int(attributes.get('SentTimestamp', 0))
+            sent_timestamp = datetime.fromtimestamp(sent_timestamp_ms / 1000.0, timezone.utc)
+            
+            if sent_timestamp.strftime('%Y-%m-%d') == target_date_str:
+                sqs_client.delete_message(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=receipt_handle
+                )
+                print(f"Deleted message sent at {sent_timestamp}")
+                num_deleted += 1
+
+    return {
+        "statusCode": 200,
+        "body": f"Deleted {num_deleted} messages sent on {target_date_str}"
+    }
+
+def receive_messages(sqs_client, queue_url):
+    response = sqs_client.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=10,  # SQS allows a maximum of 10 messages per request
+        VisibilityTimeout=30,    # Set visibility timeout as needed
+        WaitTimeSeconds=0,       # Poll immediately
+        AttributeNames=['All']   # Include all attributes, including timestamps
+    )
+    return response.get('Messages', [])
 
