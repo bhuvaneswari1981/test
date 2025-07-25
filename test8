@@ -1,3 +1,14 @@
+As a Configuration Manager
+
+I want to Operationalize the configuration and deployment of this lambda to such that the following envars are configured
+
+queue_name
+
+target_date
+
+ So that Lambda Timeout should be set for 5 minutes and Lambda naming conventions shojld follow our standard naming convention for lambdas
+
+ 
 import boto3
 from datetime import datetime, timezone
 
